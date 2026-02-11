@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Simulateur d'Arnaque - Jean Dubois</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <div class="noise-layer" aria-hidden="true"></div>
+  <main class="layout">
+    <header class="hero">
+      <p class="kicker">Master 2 IA</p>
+      <h1>Simulateur d'Arnaque Dynamique</h1>
+      <p class="subtitle">Orchestration multi-agents: Directeur, Victime, Moderateur audience.</p>
+    </header>
+
+    <section class="grid">
+      <article class="panel chat-panel">
+        <div class="panel-head">
+          <h2>Discussion</h2>
+          <button id="reset-btn" class="ghost-btn" type="button">Reinitialiser</button>
+        </div>
+        <ul id="chat-list" class="chat-list"></ul>
+
+        <form id="scammer-form" class="form-row">
+          <input id="scammer-input" name="scammer_input" type="text" placeholder="Message de l'arnaqueur..." required maxlength="1200">
+          <button type="submit">Envoyer</button>
+        </form>
+      </article>
+
+      <aside class="panel side-panel">
+        <h2>Etat de la simulation</h2>
+        <dl class="meta">
+          <dt>Provider LLM</dt>
+          <dd id="llm-provider">-</dd>
+          <dt>Modele LLM</dt>
+          <dd id="llm-model">-</dd>
+          <dt>Stage courant</dt>
+          <dd id="stage-name">-</dd>
+          <dt>Objectif courant</dt>
+          <dd id="objective">-</dd>
+          <dt>Contrainte audience</dt>
+          <dd id="audience-constraint">Aucune</dd>
+          <dt>Raison directeur</dt>
+          <dd id="director-reason">-</dd>
+        </dl>
+
+        <hr>
+
+        <h2>Audience</h2>
+        <form id="proposal-form" class="form-row">
+          <input id="proposal-input" name="proposal" type="text" placeholder="Proposition audience..." maxlength="180" required>
+          <button type="submit">Ajouter</button>
+        </form>
+
+        <div class="audience-block">
+          <p class="block-title">Propositions en attente</p>
+          <ul id="pending-list" class="small-list"></ul>
+          <button id="select-choices-btn" type="button">Selectionner 3 choix</button>
+        </div>
+
+        <div class="audience-block">
+          <p class="block-title">Choix pour vote</p>
+          <ol id="choices-list" class="choices-list"></ol>
+          <button id="simulate-vote-btn" type="button" class="ghost-btn">Vote simule</button>
+          <p id="winner-label" class="winner">Aucun vote enregistre.</p>
+        </div>
+      </aside>
+    </section>
+  </main>
+
+  <script src="/app.js" defer></script>
+</body>
+</html>
