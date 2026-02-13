@@ -18,6 +18,30 @@ const selectChoicesBtn = document.getElementById("select-choices-btn");
 const simulateVoteBtn = document.getElementById("simulate-vote-btn");
 
 let currentState = null;
+let pendingScammerMessage = "";
+
+async function withButtonLoading(button, action) {
+  if (!button) {
+    return action();
+  }
+  if (button.dataset.loading === "true") {
+    return;
+  }
+
+  button.dataset.loading = "true";
+  button.disabled = true;
+  button.classList.add("is-loading");
+  button.setAttribute("aria-busy", "true");
+
+  try {
+    return await action();
+  } finally {
+    button.dataset.loading = "false";
+    button.disabled = false;
+    button.classList.remove("is-loading");
+    button.removeAttribute("aria-busy");
+  }
+}
 
 async function api(path, options = {}) {
   const response = await fetch(path, {
@@ -26,6 +50,12 @@ async function api(path, options = {}) {
   });
 
   if (!response.ok) {
+    const contentType = response.headers.get("content-type") || "";
+    if (contentType.includes("application/json")) {
+      const payload = await response.json().catch(() => null);
+      const detail = payload && typeof payload.detail === "string" ? payload.detail : "";
+      throw new Error(detail || `Erreur HTTP ${response.status}`);
+    }
     const body = await response.text();
     throw new Error(body || `Erreur HTTP ${response.status}`);
   }
@@ -40,29 +70,33 @@ function formatTime(isoTimestamp) {
 
 function renderMessages(messages) {
   chatList.replaceChildren();
-  for (const msg of messages || []) {
+  const items = [...(messages || [])];
+  if (pendingScammerMessage) {
+    items.push({
+      role: "scammer",
+      content: pendingScammerMessage,
+      timestamp: new Date().toISOString(),
+      sound_effects: [],
+      pending: true,
+    });
+  }
+
+  for (const msg of items) {
     const li = document.createElement("li");
     li.className = `message ${msg.role}`;
+    if (msg.pending) {
+      li.classList.add("pending");
+    }
 
-    const header = document.createElement("div");
-    header.className = "message-header";
-
-    const role = document.createElement("span");
-    role.className = `role ${msg.role}`;
-    role.textContent = msg.role === "victim" ? "Jean Dubois" : "Arnaqueur";
-
-    const timestamp = document.createElement("span");
-    timestamp.className = "timestamp";
-    timestamp.textContent = formatTime(msg.timestamp);
-
-    header.append(role, timestamp);
+    const bubble = document.createElement("div");
+    bubble.className = "message-bubble";
 
     const body = document.createElement("div");
+    body.className = "message-text";
     body.textContent = msg.content;
+    bubble.appendChild(body);
 
-    li.append(header, body);
-
-    if (Array.isArray(msg.sound_effects) && msg.sound_effects.length > 0) {
+    if (Array.isArray(msg.sound_effects) && msg.sound_effects.length > 0 && !msg.pending) {
       const badgeRow = document.createElement("div");
       badgeRow.className = "sound-badges";
       for (const effect of msg.sound_effects) {
@@ -71,8 +105,23 @@ function renderMessages(messages) {
         badge.textContent = effect;
         badgeRow.appendChild(badge);
       }
-      li.appendChild(badgeRow);
+      bubble.appendChild(badgeRow);
     }
+
+    const meta = document.createElement("div");
+    meta.className = "message-meta";
+
+    const role = document.createElement("span");
+    role.className = `role ${msg.role}`;
+    role.textContent = msg.role === "victim" ? "Jean Dubois" : "Arnaqueur";
+
+    const timestamp = document.createElement("span");
+    timestamp.className = "timestamp";
+    timestamp.textContent = msg.pending ? "Envoi..." : formatTime(msg.timestamp);
+
+    meta.append(role, timestamp);
+
+    li.append(bubble, meta);
     chatList.appendChild(li);
   }
   chatList.scrollTop = chatList.scrollHeight;
@@ -87,16 +136,18 @@ function renderPending(proposals) {
   }
 }
 
-function vote(index) {
-  api("/api/audience/vote", {
-    method: "POST",
-    body: JSON.stringify({ winner_index: index }),
-  })
-    .then((state) => {
-      currentState = state;
+async function vote(index, button) {
+  try {
+    await withButtonLoading(button, async () => {
+      currentState = await api("/api/audience/vote", {
+        method: "POST",
+        body: JSON.stringify({ winner_index: index }),
+      });
       render();
-    })
-    .catch((err) => window.alert(`Vote impossible: ${err.message}`));
+    });
+  } catch (err) {
+    window.alert(`Vote impossible: ${err.message}`);
+  }
 }
 
 function renderChoices(choices) {
@@ -112,7 +163,7 @@ function renderChoices(choices) {
     const button = document.createElement("button");
     button.type = "button";
     button.textContent = "Voter";
-    button.addEventListener("click", () => vote(index));
+    button.addEventListener("click", () => vote(index, button));
 
     li.append(text, button);
     choicesList.appendChild(li);
@@ -145,15 +196,23 @@ scammerForm.addEventListener("submit", async (event) => {
   event.preventDefault();
   const message = scammerInput.value.trim();
   if (!message) return;
+  const submitBtn = event.submitter || scammerForm.querySelector('button[type="submit"]');
 
   try {
-    currentState = await api("/api/simulation/step", {
-      method: "POST",
-      body: JSON.stringify({ scammer_input: message }),
+    pendingScammerMessage = message;
+    renderMessages(currentState?.messages || []);
+    await withButtonLoading(submitBtn, async () => {
+      currentState = await api("/api/simulation/step", {
+        method: "POST",
+        body: JSON.stringify({ scammer_input: message }),
+      });
+      pendingScammerMessage = "";
+      scammerInput.value = "";
+      render();
     });
-    scammerInput.value = "";
-    render();
   } catch (err) {
+    pendingScammerMessage = "";
+    render();
     window.alert(`Envoi impossible: ${err.message}`);
   }
 });
@@ -162,14 +221,17 @@ proposalForm.addEventListener("submit", async (event) => {
   event.preventDefault();
   const proposal = proposalInput.value.trim();
   if (!proposal) return;
+  const submitBtn = event.submitter || proposalForm.querySelector('button[type="submit"]');
 
   try {
-    currentState = await api("/api/audience/submit", {
-      method: "POST",
-      body: JSON.stringify({ proposal }),
+    await withButtonLoading(submitBtn, async () => {
+      currentState = await api("/api/audience/submit", {
+        method: "POST",
+        body: JSON.stringify({ proposal }),
+      });
+      proposalInput.value = "";
+      render();
     });
-    proposalInput.value = "";
-    render();
   } catch (err) {
     window.alert(`Proposition impossible: ${err.message}`);
   }
@@ -177,11 +239,13 @@ proposalForm.addEventListener("submit", async (event) => {
 
 selectChoicesBtn.addEventListener("click", async () => {
   try {
-    currentState = await api("/api/audience/select", {
-      method: "POST",
-      body: JSON.stringify({}),
+    await withButtonLoading(selectChoicesBtn, async () => {
+      currentState = await api("/api/audience/select", {
+        method: "POST",
+        body: JSON.stringify({}),
+      });
+      render();
     });
-    render();
   } catch (err) {
     window.alert(`Selection impossible: ${err.message}`);
   }
@@ -189,11 +253,13 @@ selectChoicesBtn.addEventListener("click", async () => {
 
 simulateVoteBtn.addEventListener("click", async () => {
   try {
-    currentState = await api("/api/audience/vote/simulate", {
-      method: "POST",
-      body: JSON.stringify({}),
+    await withButtonLoading(simulateVoteBtn, async () => {
+      currentState = await api("/api/audience/vote/simulate", {
+        method: "POST",
+        body: JSON.stringify({}),
+      });
+      render();
     });
-    render();
   } catch (err) {
     window.alert(`Vote simule impossible: ${err.message}`);
   }
@@ -201,11 +267,13 @@ simulateVoteBtn.addEventListener("click", async () => {
 
 resetBtn.addEventListener("click", async () => {
   try {
-    currentState = await api("/api/simulation/reset", {
-      method: "POST",
-      body: JSON.stringify({}),
+    await withButtonLoading(resetBtn, async () => {
+      currentState = await api("/api/simulation/reset", {
+        method: "POST",
+        body: JSON.stringify({}),
+      });
+      render();
     });
-    render();
   } catch (err) {
     window.alert(`Reset impossible: ${err.message}`);
   }

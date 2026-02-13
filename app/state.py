@@ -73,13 +73,21 @@ class SimulationEngine:
                     if clean:
                         self.state.pending_proposals.append(clean[:180])
 
+            if not self.state.pending_proposals:
+                raise ValueError("Aucune proposition audience en attente. Ajoutez des propositions avant la selection.")
+
             stage_name = TECH_SUPPORT_STEPS[self.state.stage_index].name
             objective = self.state.current_objective
-            self.state.selected_choices = self.moderator.select_choices(
+            selected = self.moderator.select_choices(
                 proposals=self.state.pending_proposals,
                 stage_name=stage_name,
                 objective=objective,
             )
+            if not selected:
+                raise ValueError(
+                    "Aucune proposition audience valide disponible. Verifiez les propositions puis recommencez."
+                )
+            self.state.selected_choices = selected
             self.state.pending_proposals = []
             return self._snapshot_unlocked()
 
