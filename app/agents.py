@@ -5,6 +5,7 @@ import logging
 import os
 import re
 from dataclasses import dataclass
+from difflib import SequenceMatcher
 from typing import Dict, List
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
@@ -245,48 +246,118 @@ class AudienceModeratorAgent:
     def select_choices(self, proposals: List[str], stage_name: str, objective: str) -> List[str]:
         cleaned = self._sanitize_proposals(proposals)
         if not cleaned:
-            cleaned = self._default_choices()
+            return []
+
+        corrected = self._correct_proposals(cleaned)
+        if not corrected:
+            return []
+
+        if len(corrected) <= 3:
+            return corrected
 
         if self.chat is not None:
-            picked = self._select_with_llm(cleaned, stage_name, objective)
+            picked = self._select_with_llm(corrected, stage_name, objective)
             if picked:
                 return picked
 
-        fallback = cleaned[:3]
-        while len(fallback) < 3:
-            fallback.append(self._default_choices()[len(fallback)])
-        return fallback
+        return corrected[:3]
 
-    def _select_with_llm(self, proposals: List[str], stage_name: str, objective: str) -> List[str] | None:
+    def _correct_proposals(self, proposals: List[str]) -> List[str]:
+        if self.chat is None:
+            return proposals
+
+        corrected = self._correct_with_llm(proposals)
+        if corrected:
+            return corrected
+        return proposals
+
+    def _correct_with_llm(self, proposals: List[str]) -> List[str] | None:
         numbered = "\n".join(f"- {item}" for item in proposals)
         system_prompt = (
-            "Tu es moderateur audience. Renvoie strictement une liste JSON de 3 propositions "
-            "coherentes, non offensantes, applicables immediatement."
+            "Tu es correcteur orthographique. "
+            "Corrige uniquement l'orthographe, les accents et la ponctuation legere. "
+            "Ne change jamais le sens, n'ajoute rien, ne supprime rien. "
+            "Conserve strictement le meme ordre et le meme nombre d'elements. "
+            "Reponds strictement par une liste JSON de chaines."
         )
         user_prompt = (
-            f"Stage courant: {stage_name}\n"
-            f"Objectif courant: {objective}\n"
-            f"Propositions candidates:\n{numbered}\n"
-            "Retourne exactement 3 elements JSON."
+            "Corrige les propositions suivantes:\n"
+            f"{numbered}\n"
+            f"Tu dois renvoyer exactement {len(proposals)} elements JSON."
         )
 
         try:
             raw = self.chat.invoke([SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)])
         except Exception as exc:
-            LOGGER.warning("Moderator LLM call failed; fallback to default choices: %s", exc)
+            LOGGER.warning("Moderator spelling correction failed; keeping original proposals: %s", exc)
+            return None
+
+        parsed = _parse_json_list(_to_text(raw.content))
+        if not parsed or len(parsed) != len(proposals):
+            return None
+
+        corrected: List[str] = []
+        for original, candidate in zip(proposals, parsed):
+            normalized_candidate = " ".join(str(candidate).strip().split())
+            if not normalized_candidate:
+                corrected.append(original)
+                continue
+            if not self._is_safe_spelling_correction(original, normalized_candidate):
+                corrected.append(original)
+                continue
+            corrected.append(normalized_candidate[:180])
+
+        return self._sanitize_proposals(corrected)
+
+    def _select_with_llm(self, proposals: List[str], stage_name: str, objective: str) -> List[str] | None:
+        numbered = "\n".join(f"- {item}" for item in proposals)
+        normalized_lookup = {self._normalize_key(item): item for item in proposals}
+        system_prompt = (
+            "Tu es moderateur audience. Tu dois uniquement selectionner parmi les propositions candidates. "
+            "Ne cree jamais de nouvelle proposition. Renvoie strictement une liste JSON de 3 elements."
+        )
+        user_prompt = (
+            f"Stage courant: {stage_name}\n"
+            f"Objectif courant: {objective}\n"
+            f"Propositions candidates:\n{numbered}\n"
+            "Retourne exactement 3 elements JSON choisis dans la liste ci-dessus, sans reformulation."
+        )
+
+        try:
+            raw = self.chat.invoke([SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)])
+        except Exception as exc:
+            LOGGER.warning("Moderator LLM call failed; fallback to first proposals: %s", exc)
             return None
 
         parsed = _parse_json_list(_to_text(raw.content))
         if not parsed:
             return None
 
-        cleaned = self._sanitize_proposals(parsed)
-        if not cleaned:
-            return None
+        result: List[str] = []
+        seen = set()
 
-        result = cleaned[:3]
-        while len(result) < 3:
-            result.append(self._default_choices()[len(result)])
+        for candidate in parsed:
+            matched = normalized_lookup.get(self._normalize_key(candidate))
+            if not matched:
+                continue
+            if matched in seen:
+                continue
+            seen.add(matched)
+            result.append(matched)
+            if len(result) == 3:
+                break
+
+        if len(result) < 3:
+            for candidate in proposals:
+                if candidate in seen:
+                    continue
+                seen.add(candidate)
+                result.append(candidate)
+                if len(result) == 3:
+                    break
+
+        if len(result) < 3:
+            return None
         return result
 
     @staticmethod
@@ -309,12 +380,27 @@ class AudienceModeratorAgent:
         return out
 
     @staticmethod
-    def _default_choices() -> List[str]:
-        return [
-            "Quelqu'un sonne a la porte, Jean va ouvrir et fait attendre.",
-            "Le chien Poupoune aboie et couvre la conversation.",
-            "Jean cherche ses lunettes pendant deux minutes.",
-        ]
+    def _is_safe_spelling_correction(original: str, corrected: str) -> bool:
+        normalized_original = " ".join(str(original).strip().lower().split())
+        normalized_corrected = " ".join(str(corrected).strip().lower().split())
+        if not normalized_original or not normalized_corrected:
+            return False
+        if normalized_original == normalized_corrected:
+            return True
+
+        similarity = SequenceMatcher(None, normalized_original, normalized_corrected).ratio()
+        original_tokens = {token for token in normalized_original.split() if len(token) > 2}
+        corrected_tokens = {token for token in normalized_corrected.split() if len(token) > 2}
+        if not original_tokens:
+            token_overlap = 1.0
+        else:
+            token_overlap = len(original_tokens & corrected_tokens) / len(original_tokens)
+
+        return similarity >= 0.6 and token_overlap >= 0.5
+
+    @staticmethod
+    def _normalize_key(text: str) -> str:
+        return " ".join(str(text).strip().lower().split())
 
 
 class VictimAgent:
