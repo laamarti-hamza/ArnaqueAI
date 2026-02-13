@@ -11,6 +11,11 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, Tool
 from langchain_openai import ChatOpenAI
 
 try:
+    from langchain_anthropic import ChatAnthropic
+except Exception:
+    ChatAnthropic = None
+
+try:
     from langchain_google_genai import ChatGoogleGenerativeAI
 except Exception:
     ChatGoogleGenerativeAI = None
@@ -89,6 +94,23 @@ def _build_chat_model(settings: Settings, temperature: float):
             )
         except Exception as exc:
             LOGGER.warning("OpenAI model init failed: %s", exc)
+            return None
+
+    if settings.llm_provider == "anthropic":
+        if ChatAnthropic is None:
+            LOGGER.warning("Anthropic provider selected but langchain-anthropic is not installed.")
+            return None
+        if not settings.anthropic_api_key:
+            LOGGER.warning("Anthropic provider selected but ANTHROPIC_API_KEY is missing.")
+            return None
+        try:
+            return ChatAnthropic(
+                model_name=settings.anthropic_model,
+                temperature=temperature,
+                api_key=settings.anthropic_api_key,
+            )
+        except Exception as exc:
+            LOGGER.warning("Anthropic model init failed: %s", exc)
             return None
 
     if settings.llm_provider == "gemini":

@@ -91,6 +91,9 @@ class Settings:
     openai_api_key: str
     openai_model: str
 
+    anthropic_api_key: str
+    anthropic_model: str
+
     google_api_key: str
     google_model: str
 
@@ -105,21 +108,36 @@ class Settings:
 
     @property
     def llm_enabled(self) -> bool:
-        return self.llm_provider in {"openai", "gemini", "vertex"}
+        return self.llm_provider in {"openai", "anthropic", "gemini", "vertex"}
 
 
 def get_settings() -> Settings:
     provider_pref = os.getenv("LLM_PROVIDER", "auto").strip().lower()
 
+    # OpenAI API Key
     env_key = os.getenv("OPENAI_API_KEY", "").strip()
     key_file = os.getenv("OPENAI_API_KEY_FILE", "").strip()
-    file_key = (
+    file_key = (    
         _load_api_key_from_file(key_file, ("openai_api_key", "OPENAI_API_KEY", "api_key"))
         if key_file
         else ""
     )
     openai_api_key = env_key or file_key
 
+    # Anthropic API Key
+    anthropic_api_key_env = os.getenv("ANTHROPIC_API_KEY", "").strip()
+    anthropic_api_key_file = os.getenv("ANTHROPIC_API_KEY_FILE", "").strip()
+    anthropic_api_key_from_file = (
+        _load_api_key_from_file(
+            anthropic_api_key_file,
+            ("anthropic_api_key", "ANTHROPIC_API_KEY", "api_key"),
+        )
+        if anthropic_api_key_file
+        else ""
+    )
+    anthropic_api_key = anthropic_api_key_env or anthropic_api_key_from_file
+
+    # Google API Key
     google_api_key_env = os.getenv("GOOGLE_API_KEY", "").strip()
     google_api_key_file = os.getenv("GOOGLE_API_KEY_FILE", "").strip()
     google_api_key_from_file = (
@@ -148,11 +166,15 @@ def get_settings() -> Settings:
 
     vertex_location = os.getenv("VERTEX_LOCATION", "us-central1").strip()
     openai_model = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
+    anthropic_model = os.getenv("ANTHROPIC_MODEL", "claude-3-5-sonnet-20241022").strip()
     google_model = os.getenv("GOOGLE_MODEL", "gemini-1.5-flash").strip()
     vertex_model = os.getenv("VERTEX_MODEL", "gemini-1.5-flash-002").strip()
 
+    # Determine provider based on preference or available keys
     if provider_pref == "openai":
         llm_provider = "openai" if openai_api_key else "none"
+    elif provider_pref == "anthropic":
+        llm_provider = "anthropic" if anthropic_api_key else "none"
     elif provider_pref == "gemini":
         llm_provider = "gemini" if google_api_key else "none"
     elif provider_pref == "vertex":
@@ -160,8 +182,11 @@ def get_settings() -> Settings:
     elif provider_pref == "none":
         llm_provider = "none"
     else:
+        # Auto-detection: prefer in order - gemini, anthropic, vertex, openai
         if google_api_key:
             llm_provider = "gemini"
+        elif anthropic_api_key:
+            llm_provider = "anthropic"
         elif google_credentials:
             llm_provider = "vertex"
         elif openai_api_key:
@@ -169,8 +194,11 @@ def get_settings() -> Settings:
         else:
             llm_provider = "none"
 
+    # Set model based on provider
     if llm_provider == "openai":
         llm_model = openai_model
+    elif llm_provider == "anthropic":
+        llm_model = anthropic_model
     elif llm_provider == "gemini":
         llm_model = google_model
     elif llm_provider == "vertex":
@@ -183,6 +211,8 @@ def get_settings() -> Settings:
         llm_model=llm_model,
         openai_api_key=openai_api_key,
         openai_model=openai_model,
+        anthropic_api_key=anthropic_api_key,
+        anthropic_model=anthropic_model,
         google_api_key=google_api_key,
         google_model=google_model,
         google_application_credentials=google_credentials,
