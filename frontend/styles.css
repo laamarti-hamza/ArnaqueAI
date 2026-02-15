@@ -255,6 +255,27 @@ body::after {
   color: #eef5ff;
 }
 
+.inline-sound-tag {
+  display: inline-flex;
+  align-items: center;
+  margin: 0 0.22rem;
+  padding: 0.08rem 0.46rem;
+  border-radius: 999px;
+  border: 1px solid #bfd5fb;
+  background: #e9f2ff;
+  color: #1a4c98;
+  font-size: 0.72rem;
+  font-weight: 700;
+  white-space: nowrap;
+  vertical-align: baseline;
+}
+
+.message.scammer .inline-sound-tag {
+  border-color: rgba(255, 255, 255, 0.35);
+  background: rgba(255, 255, 255, 0.16);
+  color: #f2f7ff;
+}
+
 .form-row {
   display: grid;
   grid-template-columns: 1fr auto;

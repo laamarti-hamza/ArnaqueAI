@@ -24,6 +24,7 @@ from .config import Settings
 LOGGER = logging.getLogger(__name__)
 GOOGLE_CLOUD_SCOPE = "https://www.googleapis.com/auth/cloud-platform"
 L16_RATE_RE = re.compile(r"rate\s*=\s*(\d+)", re.IGNORECASE)
+SOUND_TAG_RE = re.compile(r"\[SOUND_EFFECT:\s*[A-Z_]+\s*\]", re.IGNORECASE)
 
 
 class VoiceSynthesisError(RuntimeError):
@@ -152,7 +153,9 @@ class VictimVoiceSynthesizer:
         clean_text = str(text or "").strip()
         if not clean_text:
             raise ValueError("Le texte a lire est vide.")
-        if len(clean_text) > 4000:
+        tts_text = SOUND_TAG_RE.sub(" ", clean_text)
+        tts_text = re.sub(r"\s+", " ", tts_text).strip() or clean_text
+        if len(tts_text) > 4000:
             raise ValueError("Le texte a lire est trop long (max 4000 caracteres).")
 
         if not self.enabled:
@@ -161,12 +164,12 @@ class VictimVoiceSynthesizer:
         style_prompt = str(self.settings.vertex_tts_style_prompt or "").strip()
 
         try:
-            return self._synthesize_once(clean_text, style_prompt=style_prompt)
+            return self._synthesize_once(tts_text, style_prompt=style_prompt)
         except Exception as exc:
             if style_prompt:
                 LOGGER.warning("Victim voice styled synthesis failed, retrying without style: %s", exc)
                 try:
-                    return self._synthesize_once(clean_text, style_prompt="")
+                    return self._synthesize_once(tts_text, style_prompt="")
                 except Exception as fallback_exc:
                     LOGGER.warning("Victim voice fallback synthesis failed: %s", fallback_exc)
                     raise VoiceSynthesisError(f"Echec de generation vocale: {fallback_exc}") from fallback_exc

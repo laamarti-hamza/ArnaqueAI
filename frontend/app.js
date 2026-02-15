@@ -16,6 +16,19 @@ const proposalInput = document.getElementById("proposal-input");
 const resetBtn = document.getElementById("reset-btn");
 const selectChoicesBtn = document.getElementById("select-choices-btn");
 const simulateVoteBtn = document.getElementById("simulate-vote-btn");
+const SOUND_EFFECT_TAG_RE = /\[SOUND_EFFECT:\s*([A-Z_]+)\s*\]/gi;
+const SOUND_EFFECT_AUDIO_MAP = {
+  DOG_BARKING: "/sounds/dog-barking.mp3",
+  DOORBELL: "/sounds/doorbell.mp3",
+  COUGHING_FIT: "/sounds/coughing.mp3",
+  TV_BACKGROUND_BFMTV: "/sounds/tvbackground.mp3",
+};
+const SOUND_EFFECT_LABEL_MAP = {
+  DOG_BARKING: "Tag: Chien aboie",
+  DOORBELL: "Tag: Sonnette",
+  COUGHING_FIT: "Tag: Quinte de toux",
+  TV_BACKGROUND_BFMTV: "Tag: TV en fond",
+};
 
 let currentState = null;
 let pendingScammerMessage = "";
@@ -26,6 +39,7 @@ let victimTypingDrainResolvers = [];
 let victimVoiceEnabled = false;
 let activeVictimAudio = null;
 let activeVictimAudioUrl = "";
+let activeEffectAudios = [];
 let lastSpokenVictimKey = "";
 let simulationStateVisible = false;
 let nextAudienceTrigger = 3;
@@ -82,6 +96,118 @@ async function parseHttpError(response) {
   }
   const body = await response.text().catch(() => "");
   return body || `Erreur HTTP ${response.status}`;
+}
+
+function normalizeSoundEffect(effect) {
+  return String(effect || "").trim().toUpperCase();
+}
+
+function getSoundEffectLabel(effect) {
+  const normalized = normalizeSoundEffect(effect);
+  return SOUND_EFFECT_LABEL_MAP[normalized] || `Tag: ${normalized}`;
+}
+
+function extractSoundEffectsFromText(text) {
+  if (!text) return [];
+  const effects = [];
+  SOUND_EFFECT_TAG_RE.lastIndex = 0;
+  let match = SOUND_EFFECT_TAG_RE.exec(text);
+  while (match) {
+    effects.push(normalizeSoundEffect(match[1]));
+    match = SOUND_EFFECT_TAG_RE.exec(text);
+  }
+  SOUND_EFFECT_TAG_RE.lastIndex = 0;
+  return effects;
+}
+
+function getMessageSoundEffects(message) {
+  const fromArray = Array.isArray(message?.sound_effects) ? message.sound_effects : [];
+  const fromText = extractSoundEffectsFromText(message?.content || "");
+  const merged = [...fromArray, ...fromText].map(normalizeSoundEffect).filter(Boolean);
+  return [...new Set(merged)];
+}
+
+function stripSoundTagsForSpeech(text) {
+  if (!text) return "";
+  const withoutTags = String(text).replace(SOUND_EFFECT_TAG_RE, " ");
+  SOUND_EFFECT_TAG_RE.lastIndex = 0;
+  return withoutTags.replace(/\s+/g, " ").trim();
+}
+
+function stopSoundEffectsPlayback() {
+  for (const audio of activeEffectAudios) {
+    try {
+      audio.pause();
+      audio.src = "";
+    } catch {
+      // Ignore cleanup errors.
+    }
+  }
+  activeEffectAudios = [];
+}
+
+async function playSoundEffectsForMessage(message) {
+  const effects = getMessageSoundEffects(message);
+  stopSoundEffectsPlayback();
+  if (effects.length === 0) {
+    return false;
+  }
+
+  const audios = [];
+  for (const effect of effects) {
+    const src = SOUND_EFFECT_AUDIO_MAP[effect];
+    if (!src) continue;
+    const audio = new Audio(src);
+    audio.preload = "auto";
+    audio.volume = effect === "TV_BACKGROUND_BFMTV" ? 0.45 : 0.85;
+    audios.push(audio);
+  }
+
+  if (audios.length === 0) {
+    return false;
+  }
+
+  activeEffectAudios = audios;
+  const results = await Promise.allSettled(
+    audios.map((audio) =>
+      audio.play().catch((err) => {
+        console.warn("Lecture d'effet sonore impossible:", err);
+        throw err;
+      }),
+    ),
+  );
+
+  return results.some((item) => item.status === "fulfilled");
+}
+
+function renderMessageTextWithInlineSoundTags(container, text) {
+  container.replaceChildren();
+  const content = String(text || "");
+  if (!content) return;
+
+  SOUND_EFFECT_TAG_RE.lastIndex = 0;
+  let cursor = 0;
+  let match = SOUND_EFFECT_TAG_RE.exec(content);
+  while (match) {
+    const [fullMatch, effectRaw] = match;
+    const start = match.index;
+    if (start > cursor) {
+      container.appendChild(document.createTextNode(content.slice(cursor, start)));
+    }
+
+    const chip = document.createElement("span");
+    chip.className = "inline-sound-tag";
+    chip.textContent = getSoundEffectLabel(effectRaw);
+    container.appendChild(chip);
+
+    cursor = start + fullMatch.length;
+    match = SOUND_EFFECT_TAG_RE.exec(content);
+  }
+
+  if (cursor < content.length) {
+    container.appendChild(document.createTextNode(content.slice(cursor)));
+  }
+  SOUND_EFFECT_TAG_RE.lastIndex = 0;
 }
 
 function setSimulationStateVisible(visible) {
@@ -193,9 +319,6 @@ function stopVictimAudioPlayback() {
 }
 
 async function speakLatestVictimMessage(state) {
-  if (!victimVoiceEnabled) {
-    return false;
-  }
   const latestVictim = getLatestVictimMessage(state);
   if (!latestVictim) {
     return false;
@@ -205,13 +328,19 @@ async function speakLatestVictimMessage(state) {
   if (!key || key === lastSpokenVictimKey) {
     return false;
   }
+  if (!victimVoiceEnabled) {
+    return false;
+  }
+
+  const textForSpeech = stripSoundTagsForSpeech(latestVictim.content);
+  const payloadText = textForSpeech || latestVictim.content;
 
   let response;
   try {
     response = await fetch("/api/voice/victim", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ text: latestVictim.content }),
+      body: JSON.stringify({ text: payloadText }),
     });
   } catch (err) {
     console.warn("Voix victime indisponible:", err);
@@ -237,12 +366,17 @@ async function speakLatestVictimMessage(state) {
   activeVictimAudio.onerror = () => stopVictimAudioPlayback();
 
   try {
-    await activeVictimAudio.play();
+    const effectsPromise = playSoundEffectsForMessage(latestVictim).catch(() => false);
+    const [voiceResult] = await Promise.allSettled([activeVictimAudio.play(), effectsPromise]);
+    if (voiceResult.status !== "fulfilled") {
+      throw voiceResult.reason || new Error("Lecture voix indisponible.");
+    }
     lastSpokenVictimKey = key;
     return true;
   } catch (err) {
     console.warn("Lecture automatique de la voix bloquee:", err);
     stopVictimAudioPlayback();
+    stopSoundEffectsPlayback();
     return false;
   }
 }
@@ -484,20 +618,8 @@ function renderMessages(messages) {
 
     const body = document.createElement("div");
     body.className = "message-text";
-    body.textContent = msg.content;
+    renderMessageTextWithInlineSoundTags(body, msg.content);
     bubble.appendChild(body);
-
-    if (Array.isArray(msg.sound_effects) && msg.sound_effects.length > 0 && !msg.pending) {
-      const badgeRow = document.createElement("div");
-      badgeRow.className = "sound-badges";
-      for (const effect of msg.sound_effects) {
-        const badge = document.createElement("span");
-        badge.className = "sound-badge";
-        badge.textContent = effect;
-        badgeRow.appendChild(badge);
-      }
-      bubble.appendChild(badgeRow);
-    }
 
     const meta = document.createElement("div");
     meta.className = "message-meta";
@@ -584,6 +706,7 @@ async function refreshState() {
   }
 
   currentState = await api("/api/simulation/state");
+  stopSoundEffectsPlayback();
   const latestVictim = getLatestVictimMessage(currentState);
   lastSpokenVictimKey = victimMessageKey(latestVictim);
   audienceFlowInProgress = false;
@@ -603,6 +726,7 @@ scammerForm.addEventListener("submit", async (event) => {
     scammerInput.value = "";
     pendingVictimMessage = "";
     stopVictimAudioPlayback();
+    stopSoundEffectsPlayback();
     resetVictimTyping();
     renderMessages(currentState?.messages || []);
     await withButtonLoading(submitBtn, async () => {
@@ -678,6 +802,7 @@ resetBtn.addEventListener("click", async () => {
       pendingVictimMessage = "";
       lastSpokenVictimKey = "";
       stopVictimAudioPlayback();
+      stopSoundEffectsPlayback();
       resetVictimTyping();
       completeAudienceFlow();
       syncAudienceTrigger(countScammerMessages(currentState));

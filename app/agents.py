@@ -46,6 +46,7 @@ STREAM_INLINE_PREFIX_RE = re.compile(
     r"(^|[\s\n])(?:annonceur|annoncer|narrateur|narration|voix off|sfx|sound effect|sound_effect|effet sonore|victime|victim|assistant|ai|jean|jean dubois)\s*:\s*",
     re.IGNORECASE,
 )
+SOUND_EFFECT_TAG_TEMPLATE = "[SOUND_EFFECT: {effect}]"
 LOGGER = logging.getLogger(__name__)
 GOOGLE_CLOUD_SCOPE = "https://www.googleapis.com/auth/cloud-platform"
 
@@ -122,14 +123,12 @@ def _stage_index_from_key(stage_key: str, fallback_stage: int, latest_scammer: s
 
 
 def _sanitize_spoken_text(raw_text: str) -> str:
-    text_without_tags = SOUND_EFFECT_INLINE_RE.sub(" ", raw_text or "")
     lines: List[str] = []
-    for raw_line in text_without_tags.splitlines():
+    for raw_line in (raw_text or "").splitlines():
         line = str(raw_line).strip()
         if not line:
             continue
-        if NARRATION_PREFIX_RE.match(line):
-            continue
+        line = NARRATION_PREFIX_RE.sub("", line).strip()
         line = SPEAKER_PREFIX_RE.sub("", line).strip()
         if not line:
             continue
@@ -144,6 +143,22 @@ def _sanitize_stream_preview(raw_text: str) -> str:
     cleaned = SOUND_EFFECT_INLINE_RE.sub(" ", raw_text or "")
     cleaned = STREAM_INLINE_PREFIX_RE.sub(r"\1", cleaned)
     return re.sub(r"\s+", " ", cleaned)
+
+
+def _ensure_sound_tags_in_text(text: str, sound_effects: List[str]) -> str:
+    normalized_text = " ".join(str(text or "").split()).strip()
+    if not sound_effects:
+        return normalized_text
+
+    existing = set(extract_sound_effects(normalized_text))
+    to_append = [effect for effect in sound_effects if effect and effect not in existing]
+    if not to_append:
+        return normalized_text
+
+    suffix = " ".join(SOUND_EFFECT_TAG_TEMPLATE.format(effect=effect) for effect in to_append)
+    if not normalized_text:
+        return suffix
+    return f"{normalized_text} {suffix}".strip()
 
 
 class GoogleGenAIChatAdapter:
@@ -1009,6 +1024,7 @@ class VictimAgent:
         text = _sanitize_spoken_text(raw_text)
         if not text:
             text = "Pardon ? Vous pouvez repeter calmement ?"
+        text = _ensure_sound_tags_in_text(text, _dedupe(sound_effects))
         if not streamed:
             self._emit_text_chunks(text, emit)
         return VictimReply(text=text, sound_effects=_dedupe(sound_effects))
@@ -1059,6 +1075,7 @@ class VictimAgent:
             text = _sanitize_spoken_text(raw_text)
             if not text:
                 text = "Pardon ? Vous pouvez repeter calmement ?"
+            text = _ensure_sound_tags_in_text(text, _dedupe(sound_effects))
             return VictimReply(text=text, sound_effects=_dedupe(sound_effects))
 
         raw_text = _to_text(first.content)
@@ -1066,6 +1083,7 @@ class VictimAgent:
         text = _sanitize_spoken_text(raw_text)
         if not text:
             text = "Pardon ? Vous pouvez repeter calmement ?"
+        text = _ensure_sound_tags_in_text(text, _dedupe(sound_effects))
         return VictimReply(text=text, sound_effects=_dedupe(sound_effects))
 
     def _respond_with_heuristic(
@@ -1099,4 +1117,5 @@ class VictimAgent:
         text = _sanitize_spoken_text(" ".join(chunks))
         if not text:
             text = "Pardon ? Vous pouvez repeter calmement ?"
+        text = _ensure_sound_tags_in_text(text, _dedupe(sound_effects))
         return VictimReply(text=text, sound_effects=_dedupe(sound_effects))

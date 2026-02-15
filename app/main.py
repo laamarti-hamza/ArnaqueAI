@@ -147,5 +147,8 @@ def simulate_vote() -> dict:
 
 
 frontend_dir = Path(__file__).resolve().parent.parent / "frontend"
+sounds_dir = Path(__file__).resolve().parent / "sounds"
+if sounds_dir.exists():
+    app.mount("/sounds", StaticFiles(directory=str(sounds_dir)), name="sounds")
 if frontend_dir.exists():
     app.mount("/", StaticFiles(directory=str(frontend_dir), html=True), name="frontend")
