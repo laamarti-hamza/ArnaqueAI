@@ -211,6 +211,17 @@ curl -X POST http://127.0.0.1:8000/api/simulation/step \
   -d "{\"scammer_input\":\"Bonjour, ici le support Microsoft.\"}"
 ```
 
+## Captures d'écran
+
+### Interface utilisateur
+![Interface utilisateur](docs/screenshots/Screenshot%202026-02-15%20234233.png)
+
+### Demande de propositions
+![Demande de propositions](docs/screenshots/Screenshot%202026-02-15%20234608.png)
+
+### Vote des propositions sélectionnées
+![Vote des propositions sélectionnées](docs/screenshots/Screenshot%202026-02-15%20234648.png)
+
 ## Sécurité et bonnes pratiques
 - Le fichier `.env` ne doit jamais être versionné.
 - Les clés JSON locales doivent rester hors dépôt public.
@@ -243,4 +254,3 @@ Le projet inclut un fallback heuristique pour continuer la simulation même en c
 ## Décharge de responsabilité
 Ce projet est fourni à des fins pédagogiques et de sensibilisation.  
 Il ne doit pas être utilisé pour concevoir, automatiser ou faciliter des activités frauduleuses.
-
