@@ -8,6 +8,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 load_dotenv()
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
 def _load_api_key_from_file(path_value: str, key_names: tuple[str, ...]) -> str:
@@ -43,8 +44,13 @@ def _resolve_existing_file(path_value: str) -> Path | None:
     if not raw:
         return None
     path = Path(raw).expanduser()
-    if path.exists() and path.is_file():
-        return path.resolve()
+    candidates = [path]
+    if not path.is_absolute():
+        candidates.append((PROJECT_ROOT / path).expanduser())
+
+    for candidate in candidates:
+        if candidate.exists() and candidate.is_file():
+            return candidate.resolve()
     return None
 
 
@@ -59,11 +65,12 @@ def _extract_project_id(path: Path) -> str:
 
 
 def _discover_google_credentials_file() -> Path | None:
-    cwd = Path.cwd()
+    search_roots = [Path.cwd(), PROJECT_ROOT]
     candidates = []
-    patterns = ("ipssi-*.json", "*service-account*.json", "*credentials*.json")
-    for pattern in patterns:
-        candidates.extend(cwd.glob(pattern))
+    patterns = ("api.json", "ipssi-*.json", "*service-account*.json", "*credentials*.json")
+    for root in search_roots:
+        for pattern in patterns:
+            candidates.extend(root.glob(pattern))
 
     unique_candidates = []
     seen = set()
@@ -168,7 +175,7 @@ def get_settings() -> Settings:
     openai_model = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
     anthropic_model = os.getenv("ANTHROPIC_MODEL", "claude-3-5-sonnet-20241022").strip()
     google_model = os.getenv("GOOGLE_MODEL", "gemini-1.5-flash").strip()
-    vertex_model = os.getenv("VERTEX_MODEL", "gemini-1.5-flash-002").strip()
+    vertex_model = os.getenv("VERTEX_MODEL", "gemini-2.0-flash-001").strip()
 
     # Determine provider based on preference or available keys
     if provider_pref == "openai":

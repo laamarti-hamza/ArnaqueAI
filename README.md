@@ -74,7 +74,7 @@ Copy-Item .env.example .env
   - `GOOGLE_APPLICATION_CREDENTIALS=./ipssi-487113-729cf7c9a4af.json`
   - `VERTEX_PROJECT_ID=ipssi-487113` (ou laisser vide, auto-detection)
   - `VERTEX_LOCATION=us-central1`
-  - `VERTEX_MODEL=gemini-1.5-flash-002`
+  - `VERTEX_MODEL=gemini-2.0-flash-001`
 - Si vous utilisez OpenAI:
   - `OPENAI_API_KEY=...`
   - `OPENAI_MODEL=gpt-4o-mini`

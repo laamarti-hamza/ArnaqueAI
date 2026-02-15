@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import re
 from dataclasses import dataclass
 from difflib import SequenceMatcher
@@ -17,14 +16,14 @@ except Exception:
     ChatAnthropic = None
 
 try:
-    from langchain_google_genai import ChatGoogleGenerativeAI
+    from google import genai
 except Exception:
-    ChatGoogleGenerativeAI = None
+    genai = None
 
 try:
-    from langchain_google_vertexai import ChatVertexAI
+    from google.oauth2 import service_account
 except Exception:
-    ChatVertexAI = None
+    service_account = None
 
 from .config import Settings
 from .scenario import TECH_SUPPORT_STEPS, detect_stage_from_text
@@ -33,9 +32,12 @@ from .tools import SOUND_TOOL_REGISTRY, extract_sound_effects, run_tool_by_name
 JSON_OBJECT_RE = re.compile(r"\{.*\}", re.DOTALL)
 JSON_LIST_RE = re.compile(r"\[.*\]", re.DOTALL)
 LOGGER = logging.getLogger(__name__)
+GOOGLE_CLOUD_SCOPE = "https://www.googleapis.com/auth/cloud-platform"
 
 
 def _to_text(content: object) -> str:
+    if content is None:
+        return ""
     if isinstance(content, str):
         return content.strip()
     return str(content).strip()
@@ -83,6 +85,118 @@ def _stage_index_from_key(stage_key: str, fallback_stage: int, latest_scammer: s
     return detect_stage_from_text(latest_scammer, fallback_stage)
 
 
+class GoogleGenAIChatAdapter:
+    def __init__(
+        self,
+        client: object,
+        model: str,
+        bound_tool_names: List[str] | None = None,
+    ) -> None:
+        self._client = client
+        self._model = model
+        self._bound_tool_names = list(bound_tool_names or [])
+
+    def bind_tools(self, tools: List[object]):
+        tool_names: List[str] = []
+        for tool in tools:
+            candidate = getattr(tool, "name", None) or getattr(tool, "__name__", None) or str(tool)
+            name = str(candidate).strip()
+            if name:
+                tool_names.append(name)
+        return GoogleGenAIChatAdapter(self._client, self._model, bound_tool_names=tool_names)
+
+    def invoke(self, messages: List[object]) -> AIMessage:
+        prompt = self._build_prompt(messages)
+        if self._bound_tool_names:
+            prompt = (
+                f"{prompt}\n\n"
+                "Outils audio disponibles: "
+                f"{', '.join(self._bound_tool_names)}.\n"
+                "Si necessaire, ajoute simplement les tags [SOUND_EFFECT: ...] dans le texte."
+            )
+
+        stream = self._client.models.generate_content_stream(
+            model=self._model,
+            contents=prompt,
+        )
+
+        chunks: List[str] = []
+        for chunk in stream:
+            chunk_text = getattr(chunk, "text", "")
+            if isinstance(chunk_text, str) and chunk_text.strip():
+                chunks.append(chunk_text)
+
+        return AIMessage(content="".join(chunks).strip())
+
+    @staticmethod
+    def _build_prompt(messages: List[object]) -> str:
+        lines: List[str] = []
+        for msg in messages:
+            if isinstance(msg, SystemMessage):
+                role = "SYSTEM"
+            elif isinstance(msg, HumanMessage):
+                role = "USER"
+            elif isinstance(msg, ToolMessage):
+                role = "TOOL"
+            else:
+                role = "ASSISTANT"
+
+            content = _to_text(getattr(msg, "content", msg))
+            if not content:
+                continue
+            lines.append(f"{role}: {content}")
+        return "\n\n".join(lines).strip()
+
+
+def _build_google_genai_chat(settings: Settings):
+    if genai is None:
+        LOGGER.warning("Google provider selected but google-genai is not installed.")
+        return None
+    if not settings.google_api_key:
+        LOGGER.warning("Gemini provider selected but GOOGLE_API_KEY is missing.")
+        return None
+    try:
+        client = genai.Client(api_key=settings.google_api_key)
+    except Exception as exc:
+        LOGGER.warning("Gemini client init failed: %s", exc)
+        return None
+    return GoogleGenAIChatAdapter(client=client, model=settings.google_model)
+
+
+def _build_google_vertex_chat(settings: Settings):
+    if genai is None or service_account is None:
+        LOGGER.warning("Vertex provider selected but google-genai/google-auth is not installed.")
+        return None
+    if not settings.google_application_credentials:
+        LOGGER.warning("Vertex provider selected but GOOGLE_APPLICATION_CREDENTIALS is missing.")
+        return None
+    if not settings.vertex_project_id:
+        LOGGER.warning("Vertex provider selected but VERTEX_PROJECT_ID is missing.")
+        return None
+
+    try:
+        credentials = service_account.Credentials.from_service_account_file(
+            settings.google_application_credentials,
+            scopes=[GOOGLE_CLOUD_SCOPE],
+        )
+    except Exception as exc:
+        LOGGER.warning("Vertex credentials init failed: %s", exc)
+        return None
+
+    try:
+        client = genai.Client(
+            vertexai=True,
+            project=settings.vertex_project_id,
+            location=settings.vertex_location,
+            credentials=credentials,
+        )
+    except Exception as exc:
+        LOGGER.warning("Vertex client init failed: %s", exc)
+        return None
+
+    return GoogleGenAIChatAdapter(client=client, model=settings.vertex_model)
+
+
 def _build_chat_model(settings: Settings, temperature: float):
     if settings.llm_provider == "openai":
         if not settings.openai_api_key:
@@ -115,47 +229,10 @@ def _build_chat_model(settings: Settings, temperature: float):
             return None
 
     if settings.llm_provider == "gemini":
-        if ChatGoogleGenerativeAI is None:
-            LOGGER.warning("Gemini provider selected but langchain-google-genai is not installed.")
-            return None
-        if not settings.google_api_key:
-            LOGGER.warning("Gemini provider selected but GOOGLE_API_KEY is missing.")
-            return None
-        try:
-            return ChatGoogleGenerativeAI(
-                model=settings.google_model,
-                temperature=temperature,
-                google_api_key=settings.google_api_key,
-            )
-        except Exception as exc:
-            LOGGER.warning("Gemini model init failed: %s", exc)
-            return None
+        return _build_google_genai_chat(settings)
 
     if settings.llm_provider == "vertex":
-        if ChatVertexAI is None:
-            LOGGER.warning("Vertex provider selected but langchain-google-vertexai is not installed.")
-            return None
-        if not settings.google_application_credentials:
-            LOGGER.warning("Vertex provider selected but GOOGLE_APPLICATION_CREDENTIALS is missing.")
-            return None
-
-        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = settings.google_application_credentials
-        kwargs = {
-            "temperature": temperature,
-            "project": settings.vertex_project_id or None,
-            "location": settings.vertex_location,
-        }
-        try:
-            return ChatVertexAI(model=settings.vertex_model, **kwargs)
-        except TypeError:
-            try:
-                return ChatVertexAI(model_name=settings.vertex_model, **kwargs)
-            except Exception as exc:
-                LOGGER.warning("Vertex model init failed: %s", exc)
-                return None
-        except Exception as exc:
-            LOGGER.warning("Vertex model init failed: %s", exc)
-            return None
+        return _build_google_vertex_chat(settings)
 
     return None
 
@@ -407,7 +484,10 @@ class VictimAgent:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self.chat = _build_chat_model(settings, temperature=0.7)
-        self.chat_with_tools = self.chat.bind_tools(list(SOUND_TOOL_REGISTRY.values())) if self.chat else None
+        if self.chat and hasattr(self.chat, "bind_tools"):
+            self.chat_with_tools = self.chat.bind_tools(list(SOUND_TOOL_REGISTRY.values()))
+        else:
+            self.chat_with_tools = self.chat
 
     def respond(
         self,
