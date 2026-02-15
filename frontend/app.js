@@ -1,13 +1,13 @@
 const chatList = document.getElementById("chat-list");
-const stageName = document.getElementById("stage-name");
-const objective = document.getElementById("objective");
 const audienceConstraint = document.getElementById("audience-constraint");
-const directorReason = document.getElementById("director-reason");
 const llmProvider = document.getElementById("llm-provider");
-const llmModel = document.getElementById("llm-model");
 const pendingList = document.getElementById("pending-list");
 const choicesList = document.getElementById("choices-list");
 const winnerLabel = document.getElementById("winner-label");
+const toggleStateBtn = document.getElementById("toggle-state-btn");
+const simulationStatePanel = document.getElementById("simulation-state");
+const proposalModal = document.getElementById("proposal-modal");
+const voteModal = document.getElementById("vote-modal");
 
 const scammerForm = document.getElementById("scammer-form");
 const scammerInput = document.getElementById("scammer-input");
@@ -27,6 +27,9 @@ let victimVoiceEnabled = false;
 let activeVictimAudio = null;
 let activeVictimAudioUrl = "";
 let lastSpokenVictimKey = "";
+let simulationStateVisible = false;
+let nextAudienceTrigger = 3;
+let audienceFlowInProgress = false;
 
 async function withButtonLoading(button, action) {
   if (!button) {
@@ -79,6 +82,84 @@ async function parseHttpError(response) {
   }
   const body = await response.text().catch(() => "");
   return body || `Erreur HTTP ${response.status}`;
+}
+
+function setSimulationStateVisible(visible) {
+  simulationStateVisible = Boolean(visible);
+  simulationStatePanel.hidden = !simulationStateVisible;
+  toggleStateBtn.setAttribute("aria-expanded", simulationStateVisible ? "true" : "false");
+  toggleStateBtn.textContent = simulationStateVisible
+    ? "Masquer l'état de la simulation"
+    : "Afficher l'état de la simulation";
+}
+
+function setModalOpen(modal, open) {
+  if (!modal) return;
+  const isOpen = Boolean(open);
+  const canUseDialogApi = typeof modal.showModal === "function" && typeof modal.close === "function";
+
+  if (isOpen) {
+    modal.hidden = false;
+    modal.setAttribute("aria-hidden", "false");
+    if (canUseDialogApi && !modal.open) {
+      modal.showModal();
+    }
+    return;
+  }
+
+  if (canUseDialogApi && modal.open) {
+    modal.close();
+  }
+  modal.hidden = true;
+  modal.setAttribute("aria-hidden", "true");
+}
+
+function openProposalModal() {
+  setModalOpen(voteModal, false);
+  setModalOpen(proposalModal, true);
+}
+
+function openVoteModal() {
+  setModalOpen(proposalModal, false);
+  setModalOpen(voteModal, true);
+}
+
+function closeAudienceFlowModals() {
+  setModalOpen(proposalModal, false);
+  setModalOpen(voteModal, false);
+}
+
+function syncAudienceTrigger(messageCount) {
+  const baseCount = Number.isFinite(messageCount) ? messageCount : 0;
+  nextAudienceTrigger = (Math.floor(baseCount / 3) + 1) * 3;
+}
+
+function countScammerMessages(state) {
+  const messages = state?.messages || [];
+  let count = 0;
+  for (const msg of messages) {
+    if (msg?.role === "scammer") {
+      count += 1;
+    }
+  }
+  return count;
+}
+
+function maybeTriggerAudienceFlow() {
+  if (audienceFlowInProgress) return;
+  const messageCount = countScammerMessages(currentState);
+  if (messageCount < nextAudienceTrigger) return;
+
+  audienceFlowInProgress = true;
+  while (nextAudienceTrigger <= messageCount) {
+    nextAudienceTrigger += 3;
+  }
+  openProposalModal();
+}
+
+function completeAudienceFlow() {
+  audienceFlowInProgress = false;
+  closeAudienceFlowModals();
 }
 
 function victimMessageKey(msg) {
@@ -317,7 +398,7 @@ async function streamSimulationStep(message) {
     throw new Error(streamError);
   }
   if (!doneEventReceived) {
-    throw new Error("Flux interrompu avant la fin de la reponse.");
+    throw new Error("Flux interrompu avant la fin de la réponse.");
   }
 }
 
@@ -358,6 +439,7 @@ async function finalizeVictimTurn(finalState) {
   pendingVictimMessage = "";
   resetVictimTyping();
   render();
+  maybeTriggerAudienceFlow();
 }
 
 function formatTime(isoTimestamp) {
@@ -386,7 +468,7 @@ function renderMessages(messages) {
       timestamp: new Date().toISOString(),
       sound_effects: [],
       pending: true,
-      pending_label: "Reponse en cours...",
+      pending_label: "Réponse en cours...",
     });
   }
 
@@ -453,6 +535,7 @@ async function vote(index, button) {
         body: JSON.stringify({ winner_index: index }),
       });
       render();
+      completeAudienceFlow();
     });
   } catch (err) {
     window.alert(`Vote impossible: ${err.message}`);
@@ -481,15 +564,11 @@ function renderChoices(choices) {
 
 function render() {
   if (!currentState) return;
-  llmProvider.textContent = currentState.llm_provider || (currentState.llm_enabled ? "configured" : "none");
-  llmModel.textContent = currentState.llm_model || "-";
-  stageName.textContent = currentState.stage_name || "-";
-  objective.textContent = currentState.current_objective || "-";
+  llmProvider.textContent = currentState.llm_provider || (currentState.llm_enabled ? "configuré" : "aucun");
   audienceConstraint.textContent = currentState.audience_constraint || "Aucune";
-  directorReason.textContent = currentState.director_reason || "-";
   winnerLabel.textContent = currentState.last_winner
-    ? `Dernier evenement gagnant: ${currentState.last_winner}`
-    : "Aucun vote enregistre.";
+    ? `Dernier événement gagnant: ${currentState.last_winner}`
+    : "Aucun vote enregistré.";
 
   renderMessages(currentState.messages);
   renderPending(currentState.pending_proposals);
@@ -507,6 +586,9 @@ async function refreshState() {
   currentState = await api("/api/simulation/state");
   const latestVictim = getLatestVictimMessage(currentState);
   lastSpokenVictimKey = victimMessageKey(latestVictim);
+  audienceFlowInProgress = false;
+  closeAudienceFlowModals();
+  syncAudienceTrigger(countScammerMessages(currentState));
   render();
 }
 
@@ -563,9 +645,10 @@ selectChoicesBtn.addEventListener("click", async () => {
         body: JSON.stringify({}),
       });
       render();
+      openVoteModal();
     });
   } catch (err) {
-    window.alert(`Selection impossible: ${err.message}`);
+    window.alert(`Sélection impossible: ${err.message}`);
   }
 });
 
@@ -577,9 +660,10 @@ simulateVoteBtn.addEventListener("click", async () => {
         body: JSON.stringify({}),
       });
       render();
+      completeAudienceFlow();
     });
   } catch (err) {
-    window.alert(`Vote simule impossible: ${err.message}`);
+    window.alert(`Vote simulé impossible: ${err.message}`);
   }
 });
 
@@ -595,12 +679,28 @@ resetBtn.addEventListener("click", async () => {
       lastSpokenVictimKey = "";
       stopVictimAudioPlayback();
       resetVictimTyping();
+      completeAudienceFlow();
+      syncAudienceTrigger(countScammerMessages(currentState));
       render();
     });
   } catch (err) {
-    window.alert(`Reset impossible: ${err.message}`);
+    window.alert(`Réinitialisation impossible: ${err.message}`);
   }
 });
+
+toggleStateBtn.addEventListener("click", () => {
+  setSimulationStateVisible(!simulationStateVisible);
+});
+
+for (const modal of [proposalModal, voteModal]) {
+  if (!modal) continue;
+  modal.addEventListener("cancel", (event) => {
+    event.preventDefault();
+  });
+}
+
+setSimulationStateVisible(false);
+closeAudienceFlowModals();
 
 refreshState().catch((err) => {
   window.alert(`Erreur de chargement initial: ${err.message}`);

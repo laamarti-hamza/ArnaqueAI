@@ -3,23 +3,40 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Simulateur d'Arnaque - Jean Dubois</title>
+  <title>Simulation d'Arnaque - Arnaqueur VS Jean Dubois</title>
   <link rel="stylesheet" href="/styles.css">
 </head>
 <body>
   <div class="noise-layer" aria-hidden="true"></div>
   <main class="layout">
     <header class="hero">
-      <p class="kicker">Master 2 IA</p>
-      <h1>Simulateur d'Arnaque Dynamique</h1>
-      <p class="subtitle">Orchestration multi-agents: Directeur, Victime, Moderateur audience.</p>
+      <div class="hero-top">
+        <div class="hero-copy">
+          <h1>Simulation d'Arnaque Interactive</h1>
+          <p class="subtitle">Arnaqueur VS Jean Dubois</p>
+        </div>
+        <button id="toggle-state-btn" class="ghost-btn" type="button" aria-expanded="false" aria-controls="simulation-state">
+          Afficher l'état de la simulation
+        </button>
+      </div>
+      <section id="simulation-state" class="simulation-state" hidden>
+        <h2>État de la simulation</h2>
+        <dl class="meta">
+          <dt>Fournisseur LLM</dt>
+          <dd id="llm-provider">-</dd>
+          <dt>Contrainte d'audience</dt>
+          <dd id="audience-constraint">Aucune</dd>
+          <dt>Dernier vote</dt>
+          <dd id="winner-label">Aucun vote enregistré.</dd>
+        </dl>
+      </section>
     </header>
 
-    <section class="grid">
+    <section class="chat-shell">
       <article class="panel chat-panel">
         <div class="panel-head">
           <h2>Discussion</h2>
-          <button id="reset-btn" class="ghost-btn" type="button">Reinitialiser</button>
+          <button id="reset-btn" class="ghost-btn" type="button">Réinitialiser</button>
         </div>
         <ul id="chat-list" class="chat-list"></ul>
 
@@ -28,47 +45,36 @@
           <button type="submit">Envoyer</button>
         </form>
       </article>
-
-      <aside class="panel side-panel">
-        <h2>Etat de la simulation</h2>
-        <dl class="meta">
-          <dt>Provider LLM</dt>
-          <dd id="llm-provider">-</dd>
-          <dt>Modele LLM</dt>
-          <dd id="llm-model">-</dd>
-          <dt>Stage courant</dt>
-          <dd id="stage-name">-</dd>
-          <dt>Objectif courant</dt>
-          <dd id="objective">-</dd>
-          <dt>Contrainte audience</dt>
-          <dd id="audience-constraint">Aucune</dd>
-          <dt>Raison directeur</dt>
-          <dd id="director-reason">-</dd>
-        </dl>
-
-        <hr>
-
-        <h2>Audience</h2>
-        <form id="proposal-form" class="form-row">
-          <input id="proposal-input" name="proposal" type="text" placeholder="Proposition audience..." maxlength="180" required>
-          <button type="submit">Ajouter</button>
-        </form>
-
-        <div class="audience-block">
-          <p class="block-title">Propositions en attente</p>
-          <ul id="pending-list" class="small-list"></ul>
-          <button id="select-choices-btn" type="button">Selectionner 3 choix</button>
-        </div>
-
-        <div class="audience-block">
-          <p class="block-title">Choix pour vote</p>
-          <ol id="choices-list" class="choices-list"></ol>
-          <button id="simulate-vote-btn" type="button" class="ghost-btn">Vote simule</button>
-          <p id="winner-label" class="winner">Aucun vote enregistre.</p>
-        </div>
-      </aside>
     </section>
   </main>
+
+  <dialog id="proposal-modal" class="app-dialog" hidden aria-hidden="true" aria-labelledby="proposal-modal-title">
+    <section class="modal-card" role="document">
+      <h2 id="proposal-modal-title">Propositions de l'audience</h2>
+      <form id="proposal-form" class="form-row">
+        <input id="proposal-input" name="proposal" type="text" placeholder="Proposition de l'audience..." maxlength="180" required>
+        <button type="submit">Ajouter</button>
+      </form>
+      <div class="audience-block">
+        <p class="block-title">Propositions en attente</p>
+        <ul id="pending-list" class="small-list"></ul>
+      </div>
+      <div class="modal-actions">
+        <button id="select-choices-btn" type="button">Sélectionner 3 choix</button>
+      </div>
+    </section>
+  </dialog>
+
+  <dialog id="vote-modal" class="app-dialog" hidden aria-hidden="true" aria-labelledby="vote-modal-title">
+    <section class="modal-card" role="document">
+      <h2 id="vote-modal-title">Vote de l'audience</h2>
+      <p class="block-title">Choix pour le vote</p>
+      <ol id="choices-list" class="choices-list"></ol>
+      <div class="modal-actions">
+        <button id="simulate-vote-btn" type="button" class="ghost-btn">Vote simulé</button>
+      </div>
+    </section>
+  </dialog>
 
   <script src="/app.js" defer></script>
 </body>

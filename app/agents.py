@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import ast
 import json
 import logging
 import re
+import unicodedata
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from typing import Callable, Dict, List
@@ -79,15 +81,36 @@ def _parse_json_object(raw_text: str) -> Dict[str, object] | None:
 def _parse_json_list(raw_text: str) -> List[str] | None:
     match = JSON_LIST_RE.search(raw_text or "")
     if not match:
-        return None
+        return _parse_fallback_list(raw_text)
     try:
         data = json.loads(match.group(0))
     except json.JSONDecodeError:
-        return None
+        # Some models return Python-like list syntax with single quotes.
+        try:
+            data = ast.literal_eval(match.group(0))
+        except Exception:
+            return _parse_fallback_list(raw_text)
     if not isinstance(data, list):
         return None
     normalized = [str(item).strip() for item in data if str(item).strip()]
     return normalized
+
+
+def _parse_fallback_list(raw_text: str) -> List[str] | None:
+    lines = [line.strip() for line in str(raw_text or "").splitlines() if line.strip()]
+    extracted: List[str] = []
+
+    for line in lines:
+        cleaned = re.sub(r"^[-*]\s+", "", line)
+        cleaned = re.sub(r"^\d+[.)]\s+", "", cleaned)
+        cleaned = cleaned.strip()
+        if not cleaned:
+            continue
+        extracted.append(cleaned)
+
+    if not extracted:
+        return None
+    return extracted
 
 
 def _stage_index_from_key(stage_key: str, fallback_stage: int, latest_scammer: str) -> int:
@@ -367,6 +390,9 @@ class AudienceModeratorAgent:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self.chat = _build_chat_model(settings, temperature=0.2)
+        self._local_spelling_lexicon = self._build_local_spelling_lexicon()
+        self._known_typo_corrections = self._build_known_typo_corrections()
+        self._remote_llm_disabled = False
 
     def select_choices(self, proposals: List[str], stage_name: str, objective: str) -> List[str]:
         cleaned = self._sanitize_proposals(proposals)
@@ -380,7 +406,7 @@ class AudienceModeratorAgent:
         if len(corrected) <= 3:
             return corrected
 
-        if self.chat is not None:
+        if self._can_use_remote_llm():
             picked = self._select_with_llm(corrected, stage_name, objective)
             if picked:
                 return picked
@@ -388,13 +414,38 @@ class AudienceModeratorAgent:
         return corrected[:3]
 
     def _correct_proposals(self, proposals: List[str]) -> List[str]:
-        if self.chat is None:
-            return proposals
+        if not self._can_use_remote_llm():
+            return self._correct_with_heuristic(proposals)
 
         corrected = self._correct_with_llm(proposals)
         if corrected:
             return corrected
-        return proposals
+        return self._correct_with_heuristic(proposals)
+
+    def _can_use_remote_llm(self) -> bool:
+        return self.chat is not None and not self._remote_llm_disabled
+
+    def _handle_remote_llm_error(self, exc: Exception, context: str) -> None:
+        if self._is_network_oauth_error(exc):
+            if not self._remote_llm_disabled:
+                self._remote_llm_disabled = True
+                LOGGER.warning(
+                    "Moderator remote LLM disabled for this run (%s): %s",
+                    context,
+                    exc,
+                )
+            return
+        LOGGER.warning("%s: %s", context, exc)
+
+    @staticmethod
+    def _is_network_oauth_error(exc: Exception) -> bool:
+        text = str(exc).lower()
+        return (
+            "oauth2.googleapis.com" in text
+            or "unexpected_eof_while_reading" in text
+            or "ssl" in text and "eof" in text
+            or "max retries exceeded" in text and "token" in text
+        )
 
     def _correct_with_llm(self, proposals: List[str]) -> List[str] | None:
         numbered = "\n".join(f"- {item}" for item in proposals)
@@ -414,7 +465,7 @@ class AudienceModeratorAgent:
         try:
             raw = self.chat.invoke([SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)])
         except Exception as exc:
-            LOGGER.warning("Moderator spelling correction failed; keeping original proposals: %s", exc)
+            self._handle_remote_llm_error(exc, "Moderator spelling correction failed; keeping original proposals")
             return None
 
         parsed = _parse_json_list(_to_text(raw.content))
@@ -434,6 +485,228 @@ class AudienceModeratorAgent:
 
         return self._sanitize_proposals(corrected)
 
+    def _correct_with_heuristic(self, proposals: List[str]) -> List[str]:
+        corrected: List[str] = []
+        for original in proposals:
+            candidate = self._correct_text_with_heuristic(original)
+            if self._is_safe_spelling_correction(original, candidate):
+                corrected.append(candidate[:180])
+            else:
+                corrected.append(original[:180])
+        return self._sanitize_proposals(corrected)
+
+    def _correct_text_with_heuristic(self, text: str) -> str:
+        normalized = " ".join(str(text or "").strip().split())
+        if not normalized:
+            return ""
+
+        tokens = re.findall(r"\w+|[^\w\s]+|\s+", normalized, flags=re.UNICODE)
+        corrected_parts: List[str] = []
+
+        for token in tokens:
+            if re.fullmatch(r"[^\W\d_]+", token, flags=re.UNICODE):
+                corrected_parts.append(self._correct_word_with_heuristic(token))
+            else:
+                corrected_parts.append(token)
+
+        out = "".join(corrected_parts)
+        out = self._polish_french_spacing(out)
+        return " ".join(out.split())
+
+    @staticmethod
+    def _polish_french_spacing(text: str) -> str:
+        out = str(text or "")
+        out = re.sub(r"\s+([,.;:!?])", r"\1", out)
+        out = re.sub(r"([([{])\s+", r"\1", out)
+        out = re.sub(r"\s+([)\]}])", r"\1", out)
+        out = re.sub(r"\s+'\s*", "'", out)
+        out = re.sub(r"\bvous\s+ete\b", "vous êtes", out, flags=re.IGNORECASE)
+        out = re.sub(r"\s+", " ", out).strip()
+        return out
+
+    def _correct_word_with_heuristic(self, word: str) -> str:
+        lower = word.lower()
+        folded = self._fold_for_spelling_check(lower)
+        if not folded:
+            return word
+
+        # Keep very short tokens untouched to avoid semantic drift.
+        if len(folded) <= 2:
+            return word
+
+        known = self._known_typo_corrections.get(folded)
+        if known:
+            return self._match_word_case(word, known)
+
+        # Accent restoration only when folded form is identical.
+        exact = self._local_spelling_lexicon.get(folded)
+        if exact:
+            return self._match_word_case(word, exact)
+        return word
+
+    @staticmethod
+    def _match_word_case(source: str, target: str) -> str:
+        if source.isupper():
+            return target.upper()
+        if source[:1].isupper():
+            return target[:1].upper() + target[1:]
+        return target
+
+    def _build_local_spelling_lexicon(self) -> Dict[str, str]:
+        seeds = {
+            "proposition",
+            "propositions",
+            "audience",
+            "selection",
+            "sélection",
+            "selectionner",
+            "sélectionner",
+            "choix",
+            "vote",
+            "simule",
+            "simulé",
+            "arnaqueur",
+            "jean",
+            "dubois",
+            "bonjour",
+            "ordinateur",
+            "telechargement",
+            "téléchargement",
+            "telephone",
+            "téléphone",
+            "microsoft",
+            "support",
+            "service",
+            "technique",
+            "windows",
+            "porte",
+            "sonne",
+            "chien",
+            "jardin",
+            "bruit",
+            "voisins",
+            "enfants",
+            "dehors",
+            "attendez",
+            "secondes",
+            "urgent",
+            "rappel",
+            "message",
+            "adresse",
+            "identite",
+            "identité",
+            "bancaire",
+            "paiement",
+            "virement",
+            "appel",
+            "appelant",
+            "preuve",
+            "officielle",
+            "calme",
+            "interruption",
+            "interrompu",
+            "reponse",
+            "réponse",
+            "repondre",
+            "répondre",
+            "etre",
+            "être",
+            "etes",
+            "êtes",
+            "tres",
+            "très",
+            "deja",
+            "déjà",
+            "ca",
+            "ça",
+            "poli",
+            "lent",
+            "repeter",
+            "répéter",
+            "precisions",
+            "précisions",
+            "probleme",
+            "problème",
+            "acces",
+            "accès",
+            "distant",
+            "installer",
+            "demarrer",
+            "démarrer",
+            "identifiants",
+            "mot",
+            "passe",
+            "pression",
+            "finale",
+        }
+
+        for step in TECH_SUPPORT_STEPS:
+            seeds.update(re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ]+", step.name))
+            seeds.update(re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ]+", step.objective))
+            for keyword in step.trigger_keywords:
+                seeds.update(re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ]+", keyword))
+
+        out: Dict[str, str] = {}
+        for raw in seeds:
+            token = str(raw).strip().lower()
+            if not token:
+                continue
+            folded = self._fold_for_spelling_check(token)
+            if not folded:
+                continue
+            chosen = out.get(folded, "")
+            if not chosen or len(token) > len(chosen):
+                out[folded] = token
+        return out
+
+    @staticmethod
+    def _build_known_typo_corrections() -> Dict[str, str]:
+        raw_map = {
+            "propositon": "proposition",
+            "propostion": "proposition",
+            "propositons": "propositions",
+            "reponse": "réponse",
+            "reponses": "réponses",
+            "selection": "sélection",
+            "selectionner": "sélectionner",
+            "selectionne": "sélectionne",
+            "simule": "simulé",
+            "simules": "simulés",
+            "simulee": "simulée",
+            "simulees": "simulées",
+            "etes": "êtes",
+            "etre": "être",
+            "tres": "très",
+            "deja": "déjà",
+            "ca": "ça",
+            "aout": "août",
+            "arret": "arrêt",
+            "arrete": "arrête",
+            "probleme": "problème",
+            "problemes": "problèmes",
+            "precisions": "précisions",
+            "precision": "précision",
+            "acces": "accès",
+            "identite": "identité",
+            "telephone": "téléphone",
+            "telecharger": "télécharger",
+            "demarrer": "démarrer",
+            "repeter": "répéter",
+            "renvoyer": "renvoyer",
+            "apel": "appel",
+            "apelant": "appelant",
+            "appell": "appel",
+            "recu": "reçu",
+            "securite": "sécurité",
+        }
+
+        normalized: Dict[str, str] = {}
+        for wrong, corrected in raw_map.items():
+            key = AudienceModeratorAgent._fold_for_spelling_check(wrong)
+            if key:
+                normalized[key] = corrected
+        return normalized
+
     def _select_with_llm(self, proposals: List[str], stage_name: str, objective: str) -> List[str] | None:
         numbered = "\n".join(f"- {item}" for item in proposals)
         normalized_lookup = {self._normalize_key(item): item for item in proposals}
@@ -451,7 +724,7 @@ class AudienceModeratorAgent:
         try:
             raw = self.chat.invoke([SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)])
         except Exception as exc:
-            LOGGER.warning("Moderator LLM call failed; fallback to first proposals: %s", exc)
+            self._handle_remote_llm_error(exc, "Moderator LLM call failed; fallback to first proposals")
             return None
 
         parsed = _parse_json_list(_to_text(raw.content))
@@ -512,20 +785,45 @@ class AudienceModeratorAgent:
             return False
         if normalized_original == normalized_corrected:
             return True
+        original_folded = AudienceModeratorAgent._fold_for_spelling_check(normalized_original)
+        corrected_folded = AudienceModeratorAgent._fold_for_spelling_check(normalized_corrected)
+        if original_folded == corrected_folded:
+            # Difference limited to accents / punctuation / case.
+            return True
 
-        similarity = SequenceMatcher(None, normalized_original, normalized_corrected).ratio()
-        original_tokens = {token for token in normalized_original.split() if len(token) > 2}
-        corrected_tokens = {token for token in normalized_corrected.split() if len(token) > 2}
-        if not original_tokens:
-            token_overlap = 1.0
-        else:
-            token_overlap = len(original_tokens & corrected_tokens) / len(original_tokens)
+        original_tokens = normalized_original.split()
+        corrected_tokens = normalized_corrected.split()
+        if len(original_tokens) != len(corrected_tokens):
+            return False
 
-        return similarity >= 0.6 and token_overlap >= 0.5
+        global_similarity = SequenceMatcher(None, normalized_original, normalized_corrected).ratio()
+        if global_similarity < 0.86:
+            return False
+
+        for original_token, corrected_token in zip(original_tokens, corrected_tokens):
+            if original_token == corrected_token:
+                continue
+
+            # Do not allow altering numeric values.
+            if any(ch.isdigit() for ch in original_token + corrected_token):
+                return False
+
+            token_similarity = SequenceMatcher(None, original_token, corrected_token).ratio()
+            if token_similarity < 0.5:
+                return False
+
+        return True
 
     @staticmethod
     def _normalize_key(text: str) -> str:
         return " ".join(str(text).strip().lower().split())
+
+    @staticmethod
+    def _fold_for_spelling_check(text: str) -> str:
+        folded = unicodedata.normalize("NFKD", str(text))
+        without_marks = "".join(ch for ch in folded if not unicodedata.combining(ch))
+        without_punct = re.sub(r"[^\w\s]", " ", without_marks, flags=re.UNICODE)
+        return " ".join(without_punct.lower().split())
 
 
 class VictimAgent:
