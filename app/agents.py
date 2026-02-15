@@ -5,7 +5,7 @@ import logging
 import re
 from dataclasses import dataclass
 from difflib import SequenceMatcher
-from typing import Dict, List
+from typing import Callable, Dict, List
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_openai import ChatOpenAI
@@ -31,6 +31,19 @@ from .tools import SOUND_TOOL_REGISTRY, extract_sound_effects, run_tool_by_name
 
 JSON_OBJECT_RE = re.compile(r"\{.*\}", re.DOTALL)
 JSON_LIST_RE = re.compile(r"\[.*\]", re.DOTALL)
+SOUND_EFFECT_INLINE_RE = re.compile(r"\[SOUND_EFFECT:\s*[A-Z_]+\s*\]", re.IGNORECASE)
+NARRATION_PREFIX_RE = re.compile(
+    r"^\s*(?:annonceur|annoncer|narrateur|narration|voix off|sfx|sound effect|sound_effect|effet sonore)\s*:\s*",
+    re.IGNORECASE,
+)
+SPEAKER_PREFIX_RE = re.compile(
+    r"^\s*(?:victime|victim|assistant|ai|jean|jean dubois)\s*:\s*",
+    re.IGNORECASE,
+)
+STREAM_INLINE_PREFIX_RE = re.compile(
+    r"(^|[\s\n])(?:annonceur|annoncer|narrateur|narration|voix off|sfx|sound effect|sound_effect|effet sonore|victime|victim|assistant|ai|jean|jean dubois)\s*:\s*",
+    re.IGNORECASE,
+)
 LOGGER = logging.getLogger(__name__)
 GOOGLE_CLOUD_SCOPE = "https://www.googleapis.com/auth/cloud-platform"
 
@@ -85,6 +98,31 @@ def _stage_index_from_key(stage_key: str, fallback_stage: int, latest_scammer: s
     return detect_stage_from_text(latest_scammer, fallback_stage)
 
 
+def _sanitize_spoken_text(raw_text: str) -> str:
+    text_without_tags = SOUND_EFFECT_INLINE_RE.sub(" ", raw_text or "")
+    lines: List[str] = []
+    for raw_line in text_without_tags.splitlines():
+        line = str(raw_line).strip()
+        if not line:
+            continue
+        if NARRATION_PREFIX_RE.match(line):
+            continue
+        line = SPEAKER_PREFIX_RE.sub("", line).strip()
+        if not line:
+            continue
+        lines.append(line)
+
+    sanitized = " ".join(lines)
+    sanitized = re.sub(r"\s+", " ", sanitized).strip()
+    return sanitized
+
+
+def _sanitize_stream_preview(raw_text: str) -> str:
+    cleaned = SOUND_EFFECT_INLINE_RE.sub(" ", raw_text or "")
+    cleaned = STREAM_INLINE_PREFIX_RE.sub(r"\1", cleaned)
+    return re.sub(r"\s+", " ", cleaned)
+
+
 class GoogleGenAIChatAdapter:
     def __init__(
         self,
@@ -105,7 +143,7 @@ class GoogleGenAIChatAdapter:
                 tool_names.append(name)
         return GoogleGenAIChatAdapter(self._client, self._model, bound_tool_names=tool_names)
 
-    def invoke(self, messages: List[object]) -> AIMessage:
+    def _build_full_prompt(self, messages: List[object]) -> str:
         prompt = self._build_prompt(messages)
         if self._bound_tool_names:
             prompt = (
@@ -114,16 +152,26 @@ class GoogleGenAIChatAdapter:
                 f"{', '.join(self._bound_tool_names)}.\n"
                 "Si necessaire, ajoute simplement les tags [SOUND_EFFECT: ...] dans le texte."
             )
+        return prompt
+
+    def stream(self, messages: List[object]):
+        prompt = self._build_full_prompt(messages)
 
         stream = self._client.models.generate_content_stream(
             model=self._model,
             contents=prompt,
         )
 
-        chunks: List[str] = []
         for chunk in stream:
             chunk_text = getattr(chunk, "text", "")
-            if isinstance(chunk_text, str) and chunk_text.strip():
+            if isinstance(chunk_text, str) and chunk_text:
+                yield AIMessage(content=chunk_text)
+
+    def invoke(self, messages: List[object]) -> AIMessage:
+        chunks: List[str] = []
+        for chunk in self.stream(messages):
+            chunk_text = getattr(chunk, "content", "")
+            if isinstance(chunk_text, str) and chunk_text:
                 chunks.append(chunk_text)
 
         return AIMessage(content="".join(chunks).strip())
@@ -504,6 +552,43 @@ class VictimAgent:
 
         return self._respond_with_heuristic(latest_scammer, objective, audience_constraint)
 
+    def respond_stream(
+        self,
+        latest_scammer: str,
+        history: List[Dict[str, object]],
+        objective: str,
+        audience_constraint: str,
+        stage_name: str,
+        on_text_chunk: Callable[[str], None] | None = None,
+    ) -> VictimReply:
+        emit = on_text_chunk or (lambda _chunk: None)
+
+        if self.chat is not None and self.chat_with_tools is not None:
+            reply = self._respond_with_llm_stream(
+                latest_scammer,
+                history,
+                objective,
+                audience_constraint,
+                stage_name,
+                emit,
+            )
+            if reply is not None:
+                return reply
+            reply = self._respond_with_llm(
+                latest_scammer,
+                history,
+                objective,
+                audience_constraint,
+                stage_name,
+            )
+            if reply is not None:
+                self._emit_text_chunks(reply.text, emit)
+                return reply
+
+        reply = self._respond_with_heuristic(latest_scammer, objective, audience_constraint)
+        self._emit_text_chunks(reply.text, emit)
+        return reply
+
     def _build_system_prompt(self, objective: str, audience_constraint: str, stage_name: str) -> str:
         return (
             "Role: Vous etes Jean Dubois, 78 ans, ancien artisan retraite. Grognon, mefiant, mais lucide. "
@@ -522,22 +607,29 @@ class VictimAgent:
             "Vous restez convaincu de vous proteger, meme quand vous commencez a trop parler.\n"
             f"Current Context: Stage={stage_name}. Objectif={objective}\n"
             f"Audience Event: {audience_constraint or 'Aucun evenement audience en cours.'}\n"
+            "Regle critique: la contrainte audience est prioritaire et doit etre prise en compte a chaque reponse quand elle existe. "
+            "Cette contrainte a une importance capitale pour la scene. "
+            "Si une contrainte audience est active, votre reponse doit surtout parler de cette contrainte et pas seulement la mentionner. "
+            "Vous devez donner des details concrets: ce qui vous derange, pourquoi c'est penible, les problemes pratiques pour la gerer, et le fait que cela se reproduit (recidive). "
+            "Exemple de logique attendue: si vous devez chasser des jeunes de votre jardin, detaillez le bruit, l'epuisement, les allers-retours, et le fait qu'ils reviennent encore. "
+            "Objectif tactique: faire durer la conversation et faire perdre du temps a l'arnaqueur grace a ces details.\n"
             "Available Tools: Vous pouvez utiliser les outils audio si la situation s'y prete "
             "(dog_bark, doorbell, coughing_fit, tv_background).\n"
-            "Style: phrases courtes. Naturelles. Parfois irritees. Lenteur volontaire. Repetitions occasionnelles. Ton realiste. Pas de jeu de rôle avec asterisques en dehors des appels système."
+            "Style: phrases courtes. Naturelles. Parfois irritees. Lenteur volontaire. Repetitions occasionnelles. Ton realiste. Pas de jeu de role avec asterisques en dehors des appels systeme. "
+            "Si une contrainte audience est active, produire une reponse plus developpee (au moins 4 phrases courtes) avec un maximum de precisions utiles pour ralentir l'appel.\n"
+            "Output strict: ecris uniquement les mots prononces par Jean. Interdit: prefixes de role (ex: ANNONCER:, NARRATEUR:, JEAN:), descriptions sceniques et didascalies."
         )
 
-
-    def _respond_with_llm(
+    def _build_victim_messages(
         self,
         latest_scammer: str,
         history: List[Dict[str, object]],
         objective: str,
         audience_constraint: str,
         stage_name: str,
-    ) -> VictimReply | None:
+    ) -> List[object]:
         prompt = self._build_system_prompt(objective, audience_constraint, stage_name)
-        messages = [SystemMessage(content=prompt)]
+        messages: List[object] = [SystemMessage(content=prompt)]
 
         for msg in history[-12:]:
             role = str(msg.get("role", ""))
@@ -550,6 +642,95 @@ class VictimAgent:
                 messages.append(AIMessage(content=content))
 
         messages.append(HumanMessage(content=latest_scammer))
+        return messages
+
+    @staticmethod
+    def _emit_text_chunks(text: str, emit: Callable[[str], None]) -> None:
+        for token in re.findall(r"\S+\s*", text or ""):
+            if token:
+                emit(token)
+
+    def _respond_with_llm_stream(
+        self,
+        latest_scammer: str,
+        history: List[Dict[str, object]],
+        objective: str,
+        audience_constraint: str,
+        stage_name: str,
+        emit: Callable[[str], None],
+    ) -> VictimReply | None:
+        stream_fn = getattr(self.chat_with_tools, "stream", None)
+        if not callable(stream_fn):
+            return None
+
+        messages = self._build_victim_messages(
+            latest_scammer=latest_scammer,
+            history=history,
+            objective=objective,
+            audience_constraint=audience_constraint,
+            stage_name=stage_name,
+        )
+
+        raw_chunks: List[str] = []
+        streamed = False
+        preview_carry = ""
+        carry_size = 64
+        try:
+            for chunk in stream_fn(messages):
+                content = getattr(chunk, "content", chunk)
+                if isinstance(content, str):
+                    piece = content
+                else:
+                    piece = _to_text(content)
+                if not piece:
+                    continue
+                raw_chunks.append(piece)
+                preview_buffer = _sanitize_stream_preview(preview_carry + piece)
+                if len(preview_buffer) <= carry_size:
+                    preview_carry = preview_buffer
+                    continue
+                emit_piece = preview_buffer[:-carry_size]
+                preview_carry = preview_buffer[-carry_size:]
+                if emit_piece and emit_piece.strip():
+                    emit(emit_piece)
+                    streamed = True
+        except Exception as exc:
+            LOGGER.warning("Victim LLM stream failed; fallback to standard call: %s", exc)
+            return None
+
+        final_preview = _sanitize_stream_preview(preview_carry)
+        if final_preview and final_preview.strip():
+            emit(final_preview)
+            streamed = True
+
+        raw_text = "".join(raw_chunks).strip()
+        if not raw_text:
+            return None
+
+        sound_effects = extract_sound_effects(raw_text)
+        text = _sanitize_spoken_text(raw_text)
+        if not text:
+            text = "Pardon ? Vous pouvez repeter calmement ?"
+        if not streamed:
+            self._emit_text_chunks(text, emit)
+        return VictimReply(text=text, sound_effects=_dedupe(sound_effects))
+
+
+    def _respond_with_llm(
+        self,
+        latest_scammer: str,
+        history: List[Dict[str, object]],
+        objective: str,
+        audience_constraint: str,
+        stage_name: str,
+    ) -> VictimReply | None:
+        messages = self._build_victim_messages(
+            latest_scammer=latest_scammer,
+            history=history,
+            objective=objective,
+            audience_constraint=audience_constraint,
+            stage_name=stage_name,
+        )
 
         try:
             first = self.chat_with_tools.invoke(messages)
@@ -575,12 +756,18 @@ class VictimAgent:
             except Exception as exc:
                 LOGGER.warning("Victim final LLM call failed after tool calls: %s", exc)
                 return None
-            text = _to_text(final.content)
-            sound_effects.extend(extract_sound_effects(text))
+            raw_text = _to_text(final.content)
+            sound_effects.extend(extract_sound_effects(raw_text))
+            text = _sanitize_spoken_text(raw_text)
+            if not text:
+                text = "Pardon ? Vous pouvez repeter calmement ?"
             return VictimReply(text=text, sound_effects=_dedupe(sound_effects))
 
-        text = _to_text(first.content)
-        sound_effects.extend(extract_sound_effects(text))
+        raw_text = _to_text(first.content)
+        sound_effects.extend(extract_sound_effects(raw_text))
+        text = _sanitize_spoken_text(raw_text)
+        if not text:
+            text = "Pardon ? Vous pouvez repeter calmement ?"
         return VictimReply(text=text, sound_effects=_dedupe(sound_effects))
 
     def _respond_with_heuristic(
@@ -591,6 +778,7 @@ class VictimAgent:
     ) -> VictimReply:
         lower = latest_scammer.lower()
         chunks: List[str] = []
+        sound_effects: List[str] = []
 
         if "mot de passe" in lower or "password" in lower or "carte" in lower:
             chunks.append("Je ne donne jamais mes informations privees par telephone.")
@@ -598,17 +786,19 @@ class VictimAgent:
             chunks.append("Attendez... je ne trouve pas le bouton Demarrer. Vous pouvez repeter lentement ?")
         elif "urgent" in lower or "vite" in lower or "maintenant" in lower:
             chunks.append("Vous allez trop vite. Je comprends rien si vous criez.")
-            chunks.append(run_tool_by_name("coughing_fit"))
+            sound_effects.extend(extract_sound_effects(run_tool_by_name("coughing_fit")))
         else:
             chunks.append("D'accord... vous dites quoi exactement sur mon ordinateur ?")
 
         if audience_constraint:
             chunks.append(f"Attendez deux secondes, {audience_constraint.lower()}")
             if "sonne" in audience_constraint.lower() or "porte" in audience_constraint.lower():
-                chunks.append(run_tool_by_name("doorbell"))
+                sound_effects.extend(extract_sound_effects(run_tool_by_name("doorbell")))
             if "chien" in audience_constraint.lower():
-                chunks.append(run_tool_by_name("dog_bark"))
+                sound_effects.extend(extract_sound_effects(run_tool_by_name("dog_bark")))
             if "tele" in audience_constraint.lower():
-                chunks.append(run_tool_by_name("tv_background"))
-        text = " ".join(chunks)
-        return VictimReply(text=text, sound_effects=extract_sound_effects(text))
+                sound_effects.extend(extract_sound_effects(run_tool_by_name("tv_background")))
+        text = _sanitize_spoken_text(" ".join(chunks))
+        if not text:
+            text = "Pardon ? Vous pouvez repeter calmement ?"
+        return VictimReply(text=text, sound_effects=_dedupe(sound_effects))

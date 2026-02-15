@@ -19,6 +19,10 @@ const simulateVoteBtn = document.getElementById("simulate-vote-btn");
 
 let currentState = null;
 let pendingScammerMessage = "";
+let pendingVictimMessage = "";
+let pendingVictimCharQueue = "";
+let victimTypingIntervalId = null;
+let victimTypingDrainResolvers = [];
 
 async function withButtonLoading(button, action) {
   if (!button) {
@@ -62,6 +66,184 @@ async function api(path, options = {}) {
   return response.json();
 }
 
+async function parseHttpError(response) {
+  const contentType = response.headers.get("content-type") || "";
+  if (contentType.includes("application/json")) {
+    const payload = await response.json().catch(() => null);
+    const detail = payload && typeof payload.detail === "string" ? payload.detail : "";
+    return detail || `Erreur HTTP ${response.status}`;
+  }
+  const body = await response.text().catch(() => "");
+  return body || `Erreur HTTP ${response.status}`;
+}
+
+function resetVictimTyping() {
+  pendingVictimCharQueue = "";
+  if (victimTypingIntervalId !== null) {
+    window.clearInterval(victimTypingIntervalId);
+    victimTypingIntervalId = null;
+  }
+  const resolvers = victimTypingDrainResolvers;
+  victimTypingDrainResolvers = [];
+  for (const resolve of resolvers) {
+    resolve();
+  }
+}
+
+function waitForVictimTypingDrain() {
+  if (!pendingVictimCharQueue && victimTypingIntervalId === null) {
+    return Promise.resolve();
+  }
+  return new Promise((resolve) => {
+    victimTypingDrainResolvers.push(resolve);
+  });
+}
+
+function ensureVictimTypingLoop() {
+  if (victimTypingIntervalId !== null) {
+    return;
+  }
+
+  victimTypingIntervalId = window.setInterval(() => {
+    if (!pendingVictimCharQueue) {
+      window.clearInterval(victimTypingIntervalId);
+      victimTypingIntervalId = null;
+      const resolvers = victimTypingDrainResolvers;
+      victimTypingDrainResolvers = [];
+      for (const resolve of resolvers) {
+        resolve();
+      }
+      return;
+    }
+
+    pendingVictimMessage += pendingVictimCharQueue[0];
+    pendingVictimCharQueue = pendingVictimCharQueue.slice(1);
+    renderMessages(currentState?.messages || []);
+  }, 14);
+}
+
+function consumeVictimStreamChunk(chunk) {
+  if (typeof chunk !== "string" || !chunk) {
+    return;
+  }
+  pendingVictimCharQueue += chunk.replace(/\r?\n/g, " ");
+  ensureVictimTypingLoop();
+}
+
+function parseSseBlock(block) {
+  const lines = block.split("\n");
+  let event = "message";
+  const dataLines = [];
+
+  for (const line of lines) {
+    if (!line) continue;
+    if (line.startsWith("event:")) {
+      event = line.slice(6).trim();
+      continue;
+    }
+    if (line.startsWith("data:")) {
+      dataLines.push(line.slice(5).trimStart());
+    }
+  }
+
+  if (dataLines.length === 0) {
+    return null;
+  }
+
+  const rawData = dataLines.join("\n");
+  try {
+    return { event, data: JSON.parse(rawData) };
+  } catch {
+    return { event, data: { raw: rawData } };
+  }
+}
+
+async function streamSimulationStep(message) {
+  const response = await fetch("/api/simulation/step/stream", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Accept: "text/event-stream" },
+    body: JSON.stringify({ scammer_input: message }),
+  });
+
+  if (!response.ok) {
+    throw new Error(await parseHttpError(response));
+  }
+
+  if (!response.body) {
+    throw new Error("Le streaming n'est pas disponible sur ce navigateur.");
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let doneEventReceived = false;
+  let streamError = "";
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) {
+      break;
+    }
+
+    buffer += decoder.decode(value, { stream: true }).replace(/\r/g, "");
+    let separatorIndex = buffer.indexOf("\n\n");
+    while (separatorIndex !== -1) {
+      const rawBlock = buffer.slice(0, separatorIndex).trim();
+      buffer = buffer.slice(separatorIndex + 2);
+      separatorIndex = buffer.indexOf("\n\n");
+
+      if (!rawBlock) continue;
+      const packet = parseSseBlock(rawBlock);
+      if (!packet) continue;
+
+      if (packet.event === "chunk") {
+        consumeVictimStreamChunk(packet.data?.text || "");
+        continue;
+      }
+
+      if (packet.event === "done") {
+        await waitForVictimTypingDrain();
+        currentState = packet.data?.state || currentState;
+        pendingScammerMessage = "";
+        pendingVictimMessage = "";
+        resetVictimTyping();
+        render();
+        doneEventReceived = true;
+        continue;
+      }
+
+      if (packet.event === "error") {
+        streamError = packet.data?.detail || "Erreur pendant le streaming.";
+      }
+    }
+  }
+
+  buffer += decoder.decode().replace(/\r/g, "");
+  if (buffer.trim()) {
+    const packet = parseSseBlock(buffer.trim());
+    if (packet?.event === "chunk") {
+      consumeVictimStreamChunk(packet.data?.text || "");
+    } else if (packet?.event === "done") {
+      await waitForVictimTypingDrain();
+      currentState = packet.data?.state || currentState;
+      pendingScammerMessage = "";
+      pendingVictimMessage = "";
+      resetVictimTyping();
+      render();
+      doneEventReceived = true;
+    } else if (packet?.event === "error") {
+      streamError = packet.data?.detail || "Erreur pendant le streaming.";
+    }
+  }
+
+  if (streamError) {
+    throw new Error(streamError);
+  }
+  if (!doneEventReceived) {
+    throw new Error("Flux interrompu avant la fin de la reponse.");
+  }
+}
+
 function formatTime(isoTimestamp) {
   if (!isoTimestamp) return "";
   const d = new Date(isoTimestamp);
@@ -78,6 +260,17 @@ function renderMessages(messages) {
       timestamp: new Date().toISOString(),
       sound_effects: [],
       pending: true,
+      pending_label: "Envoi...",
+    });
+  }
+  if (pendingVictimMessage) {
+    items.push({
+      role: "victim",
+      content: pendingVictimMessage,
+      timestamp: new Date().toISOString(),
+      sound_effects: [],
+      pending: true,
+      pending_label: "Reponse en cours...",
     });
   }
 
@@ -117,7 +310,7 @@ function renderMessages(messages) {
 
     const timestamp = document.createElement("span");
     timestamp.className = "timestamp";
-    timestamp.textContent = msg.pending ? "Envoi..." : formatTime(msg.timestamp);
+    timestamp.textContent = msg.pending ? msg.pending_label || "Envoi..." : formatTime(msg.timestamp);
 
     meta.append(role, timestamp);
 
@@ -200,18 +393,17 @@ scammerForm.addEventListener("submit", async (event) => {
 
   try {
     pendingScammerMessage = message;
+    scammerInput.value = "";
+    pendingVictimMessage = "";
+    resetVictimTyping();
     renderMessages(currentState?.messages || []);
     await withButtonLoading(submitBtn, async () => {
-      currentState = await api("/api/simulation/step", {
-        method: "POST",
-        body: JSON.stringify({ scammer_input: message }),
-      });
-      pendingScammerMessage = "";
-      scammerInput.value = "";
-      render();
+      await streamSimulationStep(message);
     });
   } catch (err) {
     pendingScammerMessage = "";
+    pendingVictimMessage = "";
+    resetVictimTyping();
     render();
     window.alert(`Envoi impossible: ${err.message}`);
   }
@@ -272,6 +464,9 @@ resetBtn.addEventListener("click", async () => {
         method: "POST",
         body: JSON.stringify({}),
       });
+      pendingScammerMessage = "";
+      pendingVictimMessage = "";
+      resetVictimTyping();
       render();
     });
   } catch (err) {

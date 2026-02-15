@@ -97,6 +97,7 @@ Puis ouvrir `http://127.0.0.1:8000`.
 - `GET /api/simulation/state`
 - `POST /api/simulation/reset`
 - `POST /api/simulation/step`
+- `POST /api/simulation/step/stream` (SSE)
 - `POST /api/audience/submit`
 - `POST /api/audience/select`
 - `POST /api/audience/vote`

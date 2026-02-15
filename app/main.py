@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import json
+from queue import Queue
+from threading import Thread
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from .config import get_settings
@@ -51,6 +55,44 @@ def simulation_step(payload: StepRequest) -> dict:
         return engine.step(payload.scammer_input)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+def _sse_event(event: str, payload: dict) -> str:
+    return f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+@app.post("/api/simulation/step/stream")
+def simulation_step_stream(payload: StepRequest) -> StreamingResponse:
+    def event_stream():
+        queue: Queue[tuple[str, dict] | None] = Queue()
+
+        def on_text_chunk(chunk: str) -> None:
+            if chunk:
+                queue.put(("chunk", {"text": chunk}))
+
+        def run_step() -> None:
+            try:
+                snapshot = engine.step_stream(payload.scammer_input, on_text_chunk=on_text_chunk)
+                queue.put(("done", {"state": snapshot}))
+            except ValueError as exc:
+                queue.put(("error", {"detail": str(exc)}))
+            except Exception:
+                queue.put(("error", {"detail": "Erreur interne pendant la reponse en streaming."}))
+            finally:
+                queue.put(None)
+
+        worker = Thread(target=run_step, daemon=True)
+        worker.start()
+
+        while True:
+            item = queue.get()
+            if item is None:
+                break
+            event_name, event_payload = item
+            yield _sse_event(event_name, event_payload)
+
+    headers = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
+    return StreamingResponse(event_stream(), media_type="text/event-stream", headers=headers)
 
 
 @app.post("/api/audience/submit")

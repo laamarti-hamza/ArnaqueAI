@@ -4,7 +4,7 @@ import random
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from threading import Lock
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
 from .agents import AudienceModeratorAgent, DirectorAgent, VictimAgent
 from .config import Settings
@@ -120,22 +120,40 @@ class SimulationEngine:
             raise ValueError("Le message arnaqueur est vide.")
 
         with self._lock:
-            prior_history = [asdict(msg) for msg in self.state.messages]
-            history_window = prior_history[-self.settings.max_history_messages :]
+            return self._step_unlocked(clean_input)
 
-            self.state.turn_count += 1
-            self._add_message_unlocked(role="scammer", content=clean_input)
+    def step_stream(self, scammer_input: str, on_text_chunk: Callable[[str], None]) -> Dict[str, object]:
+        clean_input = scammer_input.strip()
+        if not clean_input:
+            raise ValueError("Le message arnaqueur est vide.")
 
-            decision = self.director.decide(
-                latest_scammer=clean_input,
-                history=history_window,
-                current_stage=self.state.stage_index,
-            )
-            self.state.stage_index = decision.stage_index
-            self.state.current_objective = decision.objective
-            self.state.director_reason = decision.reason
+        with self._lock:
+            return self._step_unlocked(clean_input, on_text_chunk=on_text_chunk)
 
-            stage_name = TECH_SUPPORT_STEPS[self.state.stage_index].name
+    def _step_unlocked(
+        self,
+        clean_input: str,
+        on_text_chunk: Callable[[str], None] | None = None,
+    ) -> Dict[str, object]:
+        emit = on_text_chunk or (lambda _chunk: None)
+
+        prior_history = [asdict(msg) for msg in self.state.messages]
+        history_window = prior_history[-self.settings.max_history_messages :]
+
+        self.state.turn_count += 1
+        self._add_message_unlocked(role="scammer", content=clean_input)
+
+        decision = self.director.decide(
+            latest_scammer=clean_input,
+            history=history_window,
+            current_stage=self.state.stage_index,
+        )
+        self.state.stage_index = decision.stage_index
+        self.state.current_objective = decision.objective
+        self.state.director_reason = decision.reason
+
+        stage_name = TECH_SUPPORT_STEPS[self.state.stage_index].name
+        if on_text_chunk is None:
             victim_reply = self.victim.respond(
                 latest_scammer=clean_input,
                 history=history_window,
@@ -143,14 +161,23 @@ class SimulationEngine:
                 audience_constraint=self.state.audience_constraint,
                 stage_name=stage_name,
             )
-            self._add_message_unlocked(
-                role="victim",
-                content=victim_reply.text,
-                sound_effects=victim_reply.sound_effects,
+        else:
+            victim_reply = self.victim.respond_stream(
+                latest_scammer=clean_input,
+                history=history_window,
+                objective=self.state.current_objective,
+                audience_constraint=self.state.audience_constraint,
+                stage_name=stage_name,
+                on_text_chunk=emit,
             )
+        self._add_message_unlocked(
+            role="victim",
+            content=victim_reply.text,
+            sound_effects=victim_reply.sound_effects,
+        )
 
-            self._tick_audience_constraint_unlocked()
-            return self._snapshot_unlocked()
+        self._tick_audience_constraint_unlocked()
+        return self._snapshot_unlocked()
 
     def _add_message_unlocked(self, role: str, content: str, sound_effects: Optional[List[str]] = None) -> None:
         self.state.messages.append(
