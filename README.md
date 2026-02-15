@@ -56,30 +56,47 @@ L'objectif est pédagogique: illustrer les techniques de manipulation, la résis
 - Si un appel LLM distant échoue (OAuth/SSL/réseau), la simulation bascule sur des heuristiques locales.
 - La conversation continue sans blocage de l'interface.
 
-## Architecture technique
+## Architecture du projet
 
-### Backend (FastAPI)
-- `app/main.py`: API REST, streaming SSE, exposition des fichiers statiques frontend et sons.
-- `app/state.py`: moteur de simulation et état global (thread-safe).
-- `app/agents.py`: logique Directeur / Victime / Modérateur.
-- `app/voice.py`: synthèse vocale de Jean.
-- `app/tools.py`: outils audio et extraction des effets.
-- `app/scenario.py`: étapes du scénario et détection de progression.
-- `app/config.py`: chargement et auto-détection de configuration.
-- `app/schemas.py`: validation des payloads.
+### Architecture globale
+Le projet suit une architecture client-serveur simple et robuste:
+- **Frontend** (navigateur): interface de discussion, pop-ups audience, affichage des tags sonores, lecture audio.
+- **Backend** (FastAPI): API REST, streaming SSE, orchestration multi-agents, synthèse vocale.
+- **Ressources locales**: effets sonores MP3 servis par le backend (`/sounds/...`).
+- **Services IA externes** (optionnels): OpenAI, Anthropic, Gemini ou Vertex selon la configuration.
 
-### Frontend (Vanilla JS)
-- `frontend/index.html`: structure de l'interface.
-- `frontend/styles.css`: style moderne, responsive.
-- `frontend/app.js`: rendu des messages, pop-ups audience, appels API, audio voix + effets.
+Flux principal:
+1. L'arnaqueur envoie un message depuis le frontend.
+2. Le backend orchestre Directeur + Victime et met à jour l'état.
+3. La réponse victime est renvoyée en streaming SSE.
+4. Le frontend affiche la réponse progressivement, lance la voix et synchronise les effets sonores.
 
-### Ressources audio
-- `app/sounds/dog-barking.mp3`
-- `app/sounds/doorbell.mp3`
-- `app/sounds/coughing.mp3`
-- `app/sounds/tvbackground.mp3`
+### Briques techniques
+- `app/main.py`: endpoints API, streaming SSE, exposition des fichiers frontend et des sons.
+- `app/state.py`: moteur de simulation thread-safe, gestion des tours et de l'état global.
+- `app/agents.py`: agents Directeur, Victime et Modérateur audience, avec fallback heuristique.
+- `app/voice.py`: synthèse vocale de Jean Dubois et gestion des erreurs TTS.
+- `app/tools.py`: registre des outils sonores et extraction des tags `[SOUND_EFFECT: ...]`.
+- `app/scenario.py`: définition des étapes du scénario et règles de progression.
+- `app/config.py`: chargement `.env`, auto-détection des providers, paramètres d'exécution.
+- `app/schemas.py`: schémas Pydantic des requêtes API.
+- `frontend/index.html`: structure de l'application.
+- `frontend/styles.css`: thème visuel, responsive, composants UI.
+- `frontend/app.js`: logique front (chat, modales, votes, rendu, audio et synchronisation des sons).
+- `app/sounds/*`: bibliothèque des effets sonores (`dog-barking`, `doorbell`, `coughing`, `tvbackground`).
 
-## Arborescence utile
+### Technologies utilisées
+- **Langage backend**: Python
+- **Framework API**: FastAPI + Uvicorn
+- **Validation**: Pydantic
+- **Orchestration IA**: LangChain
+- **Providers LLM**: OpenAI, Anthropic, Google Gemini, Vertex AI
+- **TTS**: Google GenAI / Vertex (selon configuration)
+- **Frontend**: HTML, CSS, JavaScript (Vanilla)
+- **Communication temps réel**: Server-Sent Events (SSE)
+- **Configuration**: python-dotenv
+
+## Arborescence
 ```text
 ArnaqueAI/
 ├── app/
