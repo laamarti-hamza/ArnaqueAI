@@ -90,6 +90,13 @@ def _discover_google_credentials_file() -> Path | None:
     return None
 
 
+def _read_bool_env(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name, "").strip().lower()
+    if not raw:
+        return default
+    return raw in {"1", "true", "yes", "on", "y"}
+
+
 @dataclass(frozen=True)
 class Settings:
     llm_provider: str
@@ -108,6 +115,11 @@ class Settings:
     vertex_project_id: str
     vertex_location: str
     vertex_model: str
+    victim_voice_enabled: bool
+    vertex_tts_model: str
+    vertex_tts_voice: str
+    vertex_tts_language: str
+    vertex_tts_style_prompt: str
 
     app_host: str
     app_port: int
@@ -176,6 +188,19 @@ def get_settings() -> Settings:
     anthropic_model = os.getenv("ANTHROPIC_MODEL", "claude-3-5-sonnet-20241022").strip()
     google_model = os.getenv("GOOGLE_MODEL", "gemini-1.5-flash").strip()
     vertex_model = os.getenv("VERTEX_MODEL", "gemini-2.0-flash-001").strip()
+    victim_voice_enabled = _read_bool_env("VICTIM_VOICE_ENABLED", default=True)
+    vertex_tts_model = os.getenv("VERTEX_TTS_MODEL", "gemini-2.5-flash-preview-tts").strip()
+    vertex_tts_voice = os.getenv("VERTEX_TTS_VOICE", "Charon").strip()
+    vertex_tts_language = os.getenv("VERTEX_TTS_LANGUAGE", "fr-FR").strip()
+    vertex_tts_style_prompt = os.getenv(
+        "VERTEX_TTS_STYLE_PROMPT",
+        (
+            "Voix de Jean Dubois: homme age de 78 ans. Timbre grave, fatigue, legerement tremblant. "
+            "Debit lent, souffle court, articulation naturelle et imparfaite. "
+            "Ton realiste et humain, sans caricature, sans exageration comique. "
+            "Toujours lire exactement le texte fourni, sans ajouter ni retirer de mots."
+        ),
+    ).strip()
 
     # Determine provider based on preference or available keys
     if provider_pref == "openai":
@@ -226,6 +251,11 @@ def get_settings() -> Settings:
         vertex_project_id=vertex_project_id,
         vertex_location=vertex_location,
         vertex_model=vertex_model,
+        victim_voice_enabled=victim_voice_enabled,
+        vertex_tts_model=vertex_tts_model,
+        vertex_tts_voice=vertex_tts_voice,
+        vertex_tts_language=vertex_tts_language,
+        vertex_tts_style_prompt=vertex_tts_style_prompt,
         app_host=os.getenv("APP_HOST", "127.0.0.1").strip(),
         app_port=int(os.getenv("APP_PORT", "8000").strip()),
         max_history_messages=int(os.getenv("MAX_HISTORY_MESSAGES", "40").strip()),

@@ -24,6 +24,7 @@ Le systeme suit un script d'arnaque de type support technique, integre des outil
 - `app/main.py`: API REST + serveur frontend.
 - `app/state.py`: moteur de simulation et etat global.
 - `app/agents.py`: logique Directeur / Moderateur / Victime.
+- `app/voice.py`: synthese vocale IA de la victime (Vertex TTS).
 - `app/tools.py`: outils audio LangChain (`dog_bark`, `doorbell`, `coughing_fit`, `tv_background`).
 - `app/scenario.py`: script et progression par etapes.
 
@@ -43,6 +44,7 @@ Le systeme suit un script d'arnaque de type support technique, integre des outil
 - objectif/stage courant,
 - contrainte audience,
 - effets sonores declenches.
+7. La reponse finale de la victime peut etre lue automatiquement par une voix IA (TTS Vertex).
 
 ## Installation
 1. Creer l'environnement virtuel:
@@ -75,6 +77,11 @@ Copy-Item .env.example .env
   - `VERTEX_PROJECT_ID=ipssi-487113` (ou laisser vide, auto-detection)
   - `VERTEX_LOCATION=us-central1`
   - `VERTEX_MODEL=gemini-2.0-flash-001`
+  - `VICTIM_VOICE_ENABLED=true`
+  - `VERTEX_TTS_MODEL=gemini-2.5-flash-preview-tts`
+  - `VERTEX_TTS_VOICE=Charon`
+  - `VERTEX_TTS_LANGUAGE=fr-FR`
+  - `VERTEX_TTS_STYLE_PROMPT=Voix d'homme age, fatigue et tremblante, debit lent, ton naturel. Lire exactement le texte fourni.`
 - Si vous utilisez OpenAI:
   - `OPENAI_API_KEY=...`
   - `OPENAI_MODEL=gpt-4o-mini`
@@ -98,6 +105,7 @@ Puis ouvrir `http://127.0.0.1:8000`.
 - `POST /api/simulation/reset`
 - `POST /api/simulation/step`
 - `POST /api/simulation/step/stream` (SSE)
+- `POST /api/voice/victim`
 - `POST /api/audience/submit`
 - `POST /api/audience/select`
 - `POST /api/audience/vote`

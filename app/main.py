@@ -7,15 +7,17 @@ from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from .config import get_settings
-from .schemas import ProposalRequest, SelectChoicesRequest, StepRequest, VoteRequest
+from .schemas import ProposalRequest, SelectChoicesRequest, StepRequest, VictimVoiceRequest, VoteRequest
 from .state import SimulationEngine
+from .voice import VictimVoiceSynthesizer, VoiceSynthesisError
 
 settings = get_settings()
 engine = SimulationEngine(settings)
+victim_voice = VictimVoiceSynthesizer(settings)
 app = FastAPI(title="Simulateur d'Arnaque Dynamique")
 
 app.add_middleware(
@@ -30,12 +32,18 @@ app.add_middleware(
 @app.get("/api/health")
 def health() -> dict:
     llm_runtime_enabled = bool(engine.director.chat and engine.moderator.chat and engine.victim.chat)
+    voice_status = victim_voice.status()
     return {
         "status": "ok",
         "llm_enabled": llm_runtime_enabled,
         "llm_configured": settings.llm_enabled,
         "llm_provider": settings.llm_provider,
         "llm_model": settings.llm_model,
+        "victim_voice_enabled": voice_status.get("enabled", False),
+        "victim_voice_model": voice_status.get("model", ""),
+        "victim_voice_name": voice_status.get("voice", ""),
+        "victim_voice_language": voice_status.get("language", ""),
+        "victim_voice_reason": voice_status.get("reason", ""),
     }
 
 
@@ -93,6 +101,17 @@ def simulation_step_stream(payload: StepRequest) -> StreamingResponse:
 
     headers = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
     return StreamingResponse(event_stream(), media_type="text/event-stream", headers=headers)
+
+
+@app.post("/api/voice/victim")
+def synthesize_victim_voice(payload: VictimVoiceRequest) -> Response:
+    try:
+        audio_bytes, mime_type = victim_voice.synthesize(payload.text)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except VoiceSynthesisError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return Response(content=audio_bytes, media_type=mime_type, headers={"Cache-Control": "no-store"})
 
 
 @app.post("/api/audience/submit")

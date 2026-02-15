@@ -19,3 +19,7 @@ class SelectChoicesRequest(BaseModel):
 
 class VoteRequest(BaseModel):
     winner_index: int = Field(..., ge=0, le=2)
+
+
+class VictimVoiceRequest(BaseModel):
+    text: str = Field(..., min_length=1, max_length=4000)

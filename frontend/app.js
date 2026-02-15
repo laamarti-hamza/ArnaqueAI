@@ -23,6 +23,10 @@ let pendingVictimMessage = "";
 let pendingVictimCharQueue = "";
 let victimTypingIntervalId = null;
 let victimTypingDrainResolvers = [];
+let victimVoiceEnabled = false;
+let activeVictimAudio = null;
+let activeVictimAudioUrl = "";
+let lastSpokenVictimKey = "";
 
 async function withButtonLoading(button, action) {
   if (!button) {
@@ -77,6 +81,91 @@ async function parseHttpError(response) {
   return body || `Erreur HTTP ${response.status}`;
 }
 
+function victimMessageKey(msg) {
+  if (!msg) return "";
+  return `${msg.timestamp || ""}|${msg.content || ""}`;
+}
+
+function getLatestVictimMessage(state) {
+  const messages = state?.messages || [];
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const msg = messages[i];
+    if (msg?.role === "victim" && typeof msg.content === "string" && msg.content.trim()) {
+      return msg;
+    }
+  }
+  return null;
+}
+
+function stopVictimAudioPlayback() {
+  if (activeVictimAudio) {
+    activeVictimAudio.pause();
+    activeVictimAudio.onended = null;
+    activeVictimAudio.onerror = null;
+    activeVictimAudio.src = "";
+    activeVictimAudio = null;
+  }
+  if (activeVictimAudioUrl) {
+    URL.revokeObjectURL(activeVictimAudioUrl);
+    activeVictimAudioUrl = "";
+  }
+}
+
+async function speakLatestVictimMessage(state) {
+  if (!victimVoiceEnabled) {
+    return false;
+  }
+  const latestVictim = getLatestVictimMessage(state);
+  if (!latestVictim) {
+    return false;
+  }
+
+  const key = victimMessageKey(latestVictim);
+  if (!key || key === lastSpokenVictimKey) {
+    return false;
+  }
+
+  let response;
+  try {
+    response = await fetch("/api/voice/victim", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: latestVictim.content }),
+    });
+  } catch (err) {
+    console.warn("Voix victime indisponible:", err);
+    return false;
+  }
+
+  if (!response.ok) {
+    const detail = await parseHttpError(response).catch(() => `Erreur HTTP ${response.status}`);
+    console.warn("Synthese vocale victime impossible:", detail);
+    return false;
+  }
+
+  const blob = await response.blob().catch(() => null);
+  if (!blob || blob.size === 0) {
+    return false;
+  }
+
+  stopVictimAudioPlayback();
+  activeVictimAudioUrl = URL.createObjectURL(blob);
+  activeVictimAudio = new Audio(activeVictimAudioUrl);
+  activeVictimAudio.preload = "auto";
+  activeVictimAudio.onended = () => stopVictimAudioPlayback();
+  activeVictimAudio.onerror = () => stopVictimAudioPlayback();
+
+  try {
+    await activeVictimAudio.play();
+    lastSpokenVictimKey = key;
+    return true;
+  } catch (err) {
+    console.warn("Lecture automatique de la voix bloquee:", err);
+    stopVictimAudioPlayback();
+    return false;
+  }
+}
+
 function resetVictimTyping() {
   pendingVictimCharQueue = "";
   if (victimTypingIntervalId !== null) {
@@ -123,11 +212,7 @@ function ensureVictimTypingLoop() {
 }
 
 function consumeVictimStreamChunk(chunk) {
-  if (typeof chunk !== "string" || !chunk) {
-    return;
-  }
-  pendingVictimCharQueue += chunk.replace(/\r?\n/g, " ");
-  ensureVictimTypingLoop();
+  void chunk;
 }
 
 function parseSseBlock(block) {
@@ -202,12 +287,8 @@ async function streamSimulationStep(message) {
       }
 
       if (packet.event === "done") {
-        await waitForVictimTypingDrain();
-        currentState = packet.data?.state || currentState;
-        pendingScammerMessage = "";
-        pendingVictimMessage = "";
-        resetVictimTyping();
-        render();
+        const finalState = packet.data?.state || currentState;
+        await finalizeVictimTurn(finalState);
         doneEventReceived = true;
         continue;
       }
@@ -224,12 +305,8 @@ async function streamSimulationStep(message) {
     if (packet?.event === "chunk") {
       consumeVictimStreamChunk(packet.data?.text || "");
     } else if (packet?.event === "done") {
-      await waitForVictimTypingDrain();
-      currentState = packet.data?.state || currentState;
-      pendingScammerMessage = "";
-      pendingVictimMessage = "";
-      resetVictimTyping();
-      render();
+      const finalState = packet.data?.state || currentState;
+      await finalizeVictimTurn(finalState);
       doneEventReceived = true;
     } else if (packet?.event === "error") {
       streamError = packet.data?.detail || "Erreur pendant le streaming.";
@@ -242,6 +319,45 @@ async function streamSimulationStep(message) {
   if (!doneEventReceived) {
     throw new Error("Flux interrompu avant la fin de la reponse.");
   }
+}
+
+function buildStateWithoutFinalVictim(state) {
+  if (!state || !Array.isArray(state.messages) || state.messages.length === 0) {
+    return state;
+  }
+  const last = state.messages[state.messages.length - 1];
+  if (!last || last.role !== "victim") {
+    return state;
+  }
+  return {
+    ...state,
+    messages: state.messages.slice(0, -1),
+  };
+}
+
+async function finalizeVictimTurn(finalState) {
+  const latestVictim = getLatestVictimMessage(finalState);
+  const finalVictimText = (latestVictim?.content || "").trim();
+
+  currentState = buildStateWithoutFinalVictim(finalState);
+  pendingScammerMessage = "";
+  pendingVictimMessage = "";
+  resetVictimTyping();
+  render();
+
+  if (finalVictimText) {
+    const startAudioPromise = speakLatestVictimMessage(finalState);
+    await startAudioPromise.catch(() => false);
+    pendingVictimCharQueue = finalVictimText;
+    ensureVictimTypingLoop();
+    renderMessages(currentState?.messages || []);
+    await waitForVictimTypingDrain();
+  }
+
+  currentState = finalState;
+  pendingVictimMessage = "";
+  resetVictimTyping();
+  render();
 }
 
 function formatTime(isoTimestamp) {
@@ -381,7 +497,16 @@ function render() {
 }
 
 async function refreshState() {
+  try {
+    const health = await api("/api/health");
+    victimVoiceEnabled = Boolean(health?.victim_voice_enabled);
+  } catch {
+    victimVoiceEnabled = false;
+  }
+
   currentState = await api("/api/simulation/state");
+  const latestVictim = getLatestVictimMessage(currentState);
+  lastSpokenVictimKey = victimMessageKey(latestVictim);
   render();
 }
 
@@ -395,6 +520,7 @@ scammerForm.addEventListener("submit", async (event) => {
     pendingScammerMessage = message;
     scammerInput.value = "";
     pendingVictimMessage = "";
+    stopVictimAudioPlayback();
     resetVictimTyping();
     renderMessages(currentState?.messages || []);
     await withButtonLoading(submitBtn, async () => {
@@ -466,6 +592,8 @@ resetBtn.addEventListener("click", async () => {
       });
       pendingScammerMessage = "";
       pendingVictimMessage = "";
+      lastSpokenVictimKey = "";
+      stopVictimAudioPlayback();
       resetVictimTyping();
       render();
     });
