@@ -24,10 +24,10 @@ const SOUND_EFFECT_AUDIO_MAP = {
   TV_BACKGROUND_BFMTV: "/sounds/tvbackground.mp3",
 };
 const SOUND_EFFECT_LABEL_MAP = {
-  DOG_BARKING: "Tag: Chien aboie",
-  DOORBELL: "Tag: Sonnette",
-  COUGHING_FIT: "Tag: Quinte de toux",
-  TV_BACKGROUND_BFMTV: "Tag: TV en fond",
+  DOG_BARKING: "Son : Chien aboie",
+  DOORBELL: "Son : Sonnette",
+  COUGHING_FIT: "Son : Quinte de toux",
+  TV_BACKGROUND_BFMTV: "Son : TV en fond",
 };
 
 let currentState = null;
@@ -40,6 +40,7 @@ let victimVoiceEnabled = false;
 let activeVictimAudio = null;
 let activeVictimAudioUrl = "";
 let activeEffectAudios = [];
+let activeEffectCueTimeoutIds = [];
 let lastSpokenVictimKey = "";
 let simulationStateVisible = false;
 let nextAudienceTrigger = 3;
@@ -104,7 +105,7 @@ function normalizeSoundEffect(effect) {
 
 function getSoundEffectLabel(effect) {
   const normalized = normalizeSoundEffect(effect);
-  return SOUND_EFFECT_LABEL_MAP[normalized] || `Tag: ${normalized}`;
+  return SOUND_EFFECT_LABEL_MAP[normalized] || `Son : ${normalized}`;
 }
 
 function extractSoundEffectsFromText(text) {
@@ -134,7 +135,15 @@ function stripSoundTagsForSpeech(text) {
   return withoutTags.replace(/\s+/g, " ").trim();
 }
 
+function clearSoundEffectCueTimers() {
+  for (const timeoutId of activeEffectCueTimeoutIds) {
+    window.clearTimeout(timeoutId);
+  }
+  activeEffectCueTimeoutIds = [];
+}
+
 function stopSoundEffectsPlayback() {
+  clearSoundEffectCueTimers();
   for (const audio of activeEffectAudios) {
     try {
       audio.pause();
@@ -146,38 +155,103 @@ function stopSoundEffectsPlayback() {
   activeEffectAudios = [];
 }
 
-async function playSoundEffectsForMessage(message) {
-  const effects = getMessageSoundEffects(message);
+function buildSoundCuePlan(message) {
+  const content = String(message?.content || "");
+  const totalSpokenChars = Math.max(stripSoundTagsForSpeech(content).length, 1);
+  const cues = [];
+  let cursor = 0;
+  let spokenCharsBefore = 0;
+
+  SOUND_EFFECT_TAG_RE.lastIndex = 0;
+  let match = SOUND_EFFECT_TAG_RE.exec(content);
+  while (match) {
+    const [fullMatch, effectRaw] = match;
+    const start = match.index;
+    const plainSegment = stripSoundTagsForSpeech(content.slice(cursor, start));
+    spokenCharsBefore += plainSegment.length;
+    const effect = normalizeSoundEffect(effectRaw);
+    if (effect && SOUND_EFFECT_AUDIO_MAP[effect]) {
+      cues.push({
+        effect,
+        spokenCharsBefore,
+        totalSpokenChars,
+      });
+    }
+    cursor = start + fullMatch.length;
+    match = SOUND_EFFECT_TAG_RE.exec(content);
+  }
+  SOUND_EFFECT_TAG_RE.lastIndex = 0;
+
+  if (cues.length > 0) {
+    return cues;
+  }
+
+  const fallbackEffects = getMessageSoundEffects(message);
+  return fallbackEffects
+    .filter((effect) => SOUND_EFFECT_AUDIO_MAP[effect])
+    .map((effect) => ({ effect, spokenCharsBefore: 0, totalSpokenChars: 1 }));
+}
+
+function waitForAudioMetadata(audio, timeoutMs = 1200) {
+  if (!audio) {
+    return Promise.resolve();
+  }
+  if (Number.isFinite(audio.duration) && audio.duration > 0) {
+    return Promise.resolve();
+  }
+
+  return new Promise((resolve) => {
+    let settled = false;
+    const done = () => {
+      if (settled) return;
+      settled = true;
+      audio.removeEventListener("loadedmetadata", done);
+      audio.removeEventListener("durationchange", done);
+      resolve();
+    };
+    audio.addEventListener("loadedmetadata", done, { once: true });
+    audio.addEventListener("durationchange", done, { once: true });
+    window.setTimeout(done, timeoutMs);
+  });
+}
+
+async function scheduleSoundEffectsForMessage(voiceAudio, message) {
+  const cuePlan = buildSoundCuePlan(message);
   stopSoundEffectsPlayback();
-  if (effects.length === 0) {
+  if (cuePlan.length === 0) {
     return false;
   }
 
-  const audios = [];
-  for (const effect of effects) {
-    const src = SOUND_EFFECT_AUDIO_MAP[effect];
+  await waitForAudioMetadata(voiceAudio);
+  const durationSec =
+    Number.isFinite(voiceAudio?.duration) && voiceAudio.duration > 0 ? voiceAudio.duration : null;
+
+  for (const cue of cuePlan) {
+    const src = SOUND_EFFECT_AUDIO_MAP[cue.effect];
     if (!src) continue;
-    const audio = new Audio(src);
-    audio.preload = "auto";
-    audio.volume = effect === "TV_BACKGROUND_BFMTV" ? 0.45 : 0.85;
-    audios.push(audio);
-  }
 
-  if (audios.length === 0) {
-    return false;
-  }
+    let delayMs;
+    if (durationSec !== null) {
+      delayMs = (cue.spokenCharsBefore / cue.totalSpokenChars) * durationSec * 1000;
+    } else {
+      // Fallback when duration is unavailable: ~18 chars/sec.
+      delayMs = cue.spokenCharsBefore * 55;
+    }
+    const safeDelayMs = Math.max(0, Math.min(delayMs, 30000));
 
-  activeEffectAudios = audios;
-  const results = await Promise.allSettled(
-    audios.map((audio) =>
-      audio.play().catch((err) => {
+    const timeoutId = window.setTimeout(() => {
+      const fxAudio = new Audio(src);
+      fxAudio.preload = "auto";
+      fxAudio.volume = cue.effect === "TV_BACKGROUND_BFMTV" ? 0.45 : 0.85;
+      activeEffectAudios.push(fxAudio);
+      fxAudio.play().catch((err) => {
         console.warn("Lecture d'effet sonore impossible:", err);
-        throw err;
-      }),
-    ),
-  );
+      });
+    }, safeDelayMs);
+    activeEffectCueTimeoutIds.push(timeoutId);
+  }
 
-  return results.some((item) => item.status === "fulfilled");
+  return true;
 }
 
 function renderMessageTextWithInlineSoundTags(container, text) {
@@ -328,7 +402,22 @@ async function speakLatestVictimMessage(state) {
   if (!key || key === lastSpokenVictimKey) {
     return false;
   }
+
+  const playEffectsWithoutVoice = async () => {
+    try {
+      await scheduleSoundEffectsForMessage(null, latestVictim);
+      return true;
+    } catch (err) {
+      console.warn("Planification des effets sonores impossible:", err);
+      return false;
+    }
+  };
+
   if (!victimVoiceEnabled) {
+    const playedEffects = await playEffectsWithoutVoice();
+    if (playedEffects) {
+      lastSpokenVictimKey = key;
+    }
     return false;
   }
 
@@ -344,17 +433,29 @@ async function speakLatestVictimMessage(state) {
     });
   } catch (err) {
     console.warn("Voix victime indisponible:", err);
+    const playedEffects = await playEffectsWithoutVoice();
+    if (playedEffects) {
+      lastSpokenVictimKey = key;
+    }
     return false;
   }
 
   if (!response.ok) {
     const detail = await parseHttpError(response).catch(() => `Erreur HTTP ${response.status}`);
     console.warn("Synthese vocale victime impossible:", detail);
+    const playedEffects = await playEffectsWithoutVoice();
+    if (playedEffects) {
+      lastSpokenVictimKey = key;
+    }
     return false;
   }
 
   const blob = await response.blob().catch(() => null);
   if (!blob || blob.size === 0) {
+    const playedEffects = await playEffectsWithoutVoice();
+    if (playedEffects) {
+      lastSpokenVictimKey = key;
+    }
     return false;
   }
 
@@ -362,21 +463,31 @@ async function speakLatestVictimMessage(state) {
   activeVictimAudioUrl = URL.createObjectURL(blob);
   activeVictimAudio = new Audio(activeVictimAudioUrl);
   activeVictimAudio.preload = "auto";
-  activeVictimAudio.onended = () => stopVictimAudioPlayback();
-  activeVictimAudio.onerror = () => stopVictimAudioPlayback();
+  activeVictimAudio.onended = () => {
+    stopVictimAudioPlayback();
+    stopSoundEffectsPlayback();
+  };
+  activeVictimAudio.onerror = () => {
+    stopVictimAudioPlayback();
+    stopSoundEffectsPlayback();
+  };
 
   try {
-    const effectsPromise = playSoundEffectsForMessage(latestVictim).catch(() => false);
-    const [voiceResult] = await Promise.allSettled([activeVictimAudio.play(), effectsPromise]);
-    if (voiceResult.status !== "fulfilled") {
-      throw voiceResult.reason || new Error("Lecture voix indisponible.");
-    }
+    await activeVictimAudio.play();
     lastSpokenVictimKey = key;
+    void scheduleSoundEffectsForMessage(activeVictimAudio, latestVictim).catch((err) => {
+      console.warn("Planification des effets sonores impossible:", err);
+    });
     return true;
   } catch (err) {
     console.warn("Lecture automatique de la voix bloquee:", err);
     stopVictimAudioPlayback();
-    stopSoundEffectsPlayback();
+    const playedEffects = await playEffectsWithoutVoice();
+    if (!playedEffects) {
+      stopSoundEffectsPlayback();
+    } else {
+      lastSpokenVictimKey = key;
+    }
     return false;
   }
 }
@@ -561,8 +672,10 @@ async function finalizeVictimTurn(finalState) {
   render();
 
   if (finalVictimText) {
-    const startAudioPromise = speakLatestVictimMessage(finalState);
-    await startAudioPromise.catch(() => false);
+    await speakLatestVictimMessage(finalState).catch((err) => {
+      console.warn("Lecture voix victime indisponible:", err);
+      return false;
+    });
     pendingVictimCharQueue = finalVictimText;
     ensureVictimTypingLoop();
     renderMessages(currentState?.messages || []);

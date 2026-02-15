@@ -51,6 +51,17 @@ LOGGER = logging.getLogger(__name__)
 GOOGLE_CLOUD_SCOPE = "https://www.googleapis.com/auth/cloud-platform"
 
 
+def _is_network_oauth_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return (
+        "oauth2.googleapis.com" in text
+        or "unexpected_eof_while_reading" in text
+        or "ssl" in text and "eof" in text
+        or "max retries exceeded" in text and "token" in text
+        or "failed to establish a new connection" in text and "oauth2" in text
+    )
+
+
 def _to_text(content: object) -> str:
     if content is None:
         return ""
@@ -340,9 +351,10 @@ class DirectorAgent:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self.chat = _build_chat_model(settings, temperature=0.1)
+        self._remote_llm_disabled = False
 
     def decide(self, latest_scammer: str, history: List[Dict[str, object]], current_stage: int) -> DirectorDecision:
-        if self.chat is not None:
+        if self._can_use_remote_llm():
             decision = self._decide_with_llm(latest_scammer, history, current_stage)
             if decision is not None:
                 return decision
@@ -351,6 +363,17 @@ class DirectorAgent:
         objective = TECH_SUPPORT_STEPS[stage_index].objective
         reason = "Heuristique locale: progression basee sur mots-cles."
         return DirectorDecision(stage_index=stage_index, objective=objective, reason=reason)
+
+    def _can_use_remote_llm(self) -> bool:
+        return self.chat is not None and not self._remote_llm_disabled
+
+    def _handle_remote_llm_error(self, exc: Exception) -> None:
+        if _is_network_oauth_error(exc):
+            if not self._remote_llm_disabled:
+                self._remote_llm_disabled = True
+                LOGGER.warning("Director remote LLM disabled for this run: %s", exc)
+            return
+        LOGGER.warning("Director LLM call failed; fallback to heuristic: %s", exc)
 
     def _decide_with_llm(
         self,
@@ -382,7 +405,7 @@ class DirectorAgent:
         try:
             raw = self.chat.invoke([SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)])
         except Exception as exc:
-            LOGGER.warning("Director LLM call failed; fallback to heuristic: %s", exc)
+            self._handle_remote_llm_error(exc)
             return None
 
         payload = _parse_json_object(_to_text(raw.content))
@@ -441,7 +464,7 @@ class AudienceModeratorAgent:
         return self.chat is not None and not self._remote_llm_disabled
 
     def _handle_remote_llm_error(self, exc: Exception, context: str) -> None:
-        if self._is_network_oauth_error(exc):
+        if _is_network_oauth_error(exc):
             if not self._remote_llm_disabled:
                 self._remote_llm_disabled = True
                 LOGGER.warning(
@@ -451,16 +474,6 @@ class AudienceModeratorAgent:
                 )
             return
         LOGGER.warning("%s: %s", context, exc)
-
-    @staticmethod
-    def _is_network_oauth_error(exc: Exception) -> bool:
-        text = str(exc).lower()
-        return (
-            "oauth2.googleapis.com" in text
-            or "unexpected_eof_while_reading" in text
-            or "ssl" in text and "eof" in text
-            or "max retries exceeded" in text and "token" in text
-        )
 
     def _correct_with_llm(self, proposals: List[str]) -> List[str] | None:
         numbered = "\n".join(f"- {item}" for item in proposals)
@@ -845,6 +858,7 @@ class VictimAgent:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self.chat = _build_chat_model(settings, temperature=0.7)
+        self._remote_llm_disabled = False
         if self.chat and hasattr(self.chat, "bind_tools"):
             self.chat_with_tools = self.chat.bind_tools(list(SOUND_TOOL_REGISTRY.values()))
         else:
@@ -858,7 +872,7 @@ class VictimAgent:
         audience_constraint: str,
         stage_name: str,
     ) -> VictimReply:
-        if self.chat is not None and self.chat_with_tools is not None:
+        if self._can_use_remote_llm():
             reply = self._respond_with_llm(latest_scammer, history, objective, audience_constraint, stage_name)
             if reply is not None:
                 return reply
@@ -876,7 +890,7 @@ class VictimAgent:
     ) -> VictimReply:
         emit = on_text_chunk or (lambda _chunk: None)
 
-        if self.chat is not None and self.chat_with_tools is not None:
+        if self._can_use_remote_llm():
             reply = self._respond_with_llm_stream(
                 latest_scammer,
                 history,
@@ -887,20 +901,32 @@ class VictimAgent:
             )
             if reply is not None:
                 return reply
-            reply = self._respond_with_llm(
-                latest_scammer,
-                history,
-                objective,
-                audience_constraint,
-                stage_name,
-            )
-            if reply is not None:
-                self._emit_text_chunks(reply.text, emit)
-                return reply
+            if self._can_use_remote_llm():
+                reply = self._respond_with_llm(
+                    latest_scammer,
+                    history,
+                    objective,
+                    audience_constraint,
+                    stage_name,
+                )
+                if reply is not None:
+                    self._emit_text_chunks(reply.text, emit)
+                    return reply
 
         reply = self._respond_with_heuristic(latest_scammer, objective, audience_constraint)
         self._emit_text_chunks(reply.text, emit)
         return reply
+
+    def _can_use_remote_llm(self) -> bool:
+        return self.chat is not None and self.chat_with_tools is not None and not self._remote_llm_disabled
+
+    def _handle_remote_llm_error(self, exc: Exception, context: str) -> None:
+        if _is_network_oauth_error(exc):
+            if not self._remote_llm_disabled:
+                self._remote_llm_disabled = True
+                LOGGER.warning("Victim remote LLM disabled for this run (%s): %s", context, exc)
+            return
+        LOGGER.warning("%s: %s", context, exc)
 
     def _build_system_prompt(self, objective: str, audience_constraint: str, stage_name: str) -> str:
         return (
@@ -1008,7 +1034,7 @@ class VictimAgent:
                     emit(emit_piece)
                     streamed = True
         except Exception as exc:
-            LOGGER.warning("Victim LLM stream failed; fallback to standard call: %s", exc)
+            self._handle_remote_llm_error(exc, "Victim LLM stream failed; fallback to standard call")
             return None
 
         final_preview = _sanitize_stream_preview(preview_carry)
@@ -1049,7 +1075,7 @@ class VictimAgent:
         try:
             first = self.chat_with_tools.invoke(messages)
         except Exception as exc:
-            LOGGER.warning("Victim LLM call failed; fallback to heuristic: %s", exc)
+            self._handle_remote_llm_error(exc, "Victim LLM call failed; fallback to heuristic")
             return None
 
         sound_effects: List[str] = []
@@ -1068,7 +1094,7 @@ class VictimAgent:
             try:
                 final = self.chat.invoke(messages + [first] + tool_messages)
             except Exception as exc:
-                LOGGER.warning("Victim final LLM call failed after tool calls: %s", exc)
+                self._handle_remote_llm_error(exc, "Victim final LLM call failed after tool calls")
                 return None
             raw_text = _to_text(final.content)
             sound_effects.extend(extract_sound_effects(raw_text))
